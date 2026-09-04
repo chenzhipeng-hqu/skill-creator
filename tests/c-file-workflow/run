@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="${SKILL_REPO_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
+skill_under_test="${SKILL_UNDER_TEST:-${repo_root}/sk-c-file-workflow}"
+export SKILL_UNDER_TEST="${skill_under_test}"
+
+exec python3 "${repo_root}/tests/c-file-workflow/test_workflow.py"

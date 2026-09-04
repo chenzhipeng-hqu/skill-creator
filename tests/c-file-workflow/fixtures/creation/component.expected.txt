@@ -1,0 +1,12 @@
+uart.c
+uart.h
+typedef int (*handler_t)(uart_t *me);
+static const handler_t uart_handler[ST_MAX]
+ST_IDLE = 0
+ST_END
+ST_MAX
+uartPub_t *uart_getPub(uint8_t id)
+int uart_setCallback(uartPub_t *pub, const uartCB_t *cb)
+int uart_status(uartPub_t *pub)
+int uart_init(void)
+int uart_routine(void)

@@ -1,13 +1,13 @@
 ---
-status: proposed
+status: accepted
 ---
 
-# Unify C file creation, formatting, and checking
+# Unify the C file workflow
 
-Use one `c-file-format` skill for all Managed C Files rather than tying layout rules to component architecture. A bare C file name selects creation from the C File Templates, while existing `.c` and `.h` paths select in-place Style Format; the same formatting core also provides a read-only Style Check. This keeps one formatting authority while leaving Pub/CB/Ops, state machines, and other component semantics outside the skill.
+Use one `c-file-workflow` Skill for mechanical C/H formatting, deterministic checks, default Pub/CB/Ops component creation, Agent-guided migration, and documented external-chip Register Structure conventions. This replaces overlapping generic-format and GD32-component Skills while keeping Style Format, Component Structure Check, and behavior-aware Component Migration as distinct operations; the detailed contract lives in [the C File Workflow design](../design/c-file-workflow.md).
 
 ## Considered Options
 
-- Keep the three capabilities in `gd32-component-creator`: rejected because ordinary board, task, driver, and utility files are not necessarily components.
-- Create separate template, formatter, and checker skills: rejected because their formatting rules could drift and users would need to choose between overlapping tools.
-- Require an explicit subcommand for every operation: not selected for the common create/format paths because input shape can distinguish them; explicit syntax for Style Check remains undecided.
+- Separate template, formatter, checker, and component Skills: rejected because their shared formatting and component conventions could drift.
+- Keep `gd32-component-creator`: rejected because the unified workflow now owns its component and register conventions; retirement remains an explicit user action.
+- Name the Skill `c-file-format`: rejected after component creation, checking, and migration made formatting too narrow a description.

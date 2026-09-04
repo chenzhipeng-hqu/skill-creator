@@ -1,0 +1,4 @@
+interface:
+  display_name: "C File Workflow"
+  short_description: "Create, format, and check self-authored C/H files."
+  default_prompt: "Use $c-file-workflow to create or process self-authored C/H files and run the requested style or structural checks."
