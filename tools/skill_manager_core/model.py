@@ -51,6 +51,7 @@ class Plan:
     full_diff: bool = False
     validate_stable: bool = False
     validate_all: bool = False
+    dry_run: bool = False
 
 
 @dataclass(frozen=True)

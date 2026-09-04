@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import difflib
+import json
+import os
+import shutil
+import uuid
 from pathlib import Path
 
 from .discovery import scan_repository
 from .identity import IdentityError, canonical_skill_name, package_identity, package_manifest
+from .journal import JournalError, append_event, read_events, read_plan, write_plan
 from .model import Candidate, CandidateSource, Diagnostic, Plan, Result, Scan
 from .reporting import OperationReport, utc_now
 from .test_runner import run_skill_test
@@ -36,10 +41,11 @@ class SkillManager:
         full_diff: bool = False,
         validate_stable: bool = False,
         validate_all: bool = False,
+        dry_run: bool = False,
     ) -> Plan:
         """Prepare one typed command from a Scan."""
 
-        if command not in {"list", "status", "diff", "validate"}:
+        if command not in {"list", "status", "diff", "validate", "promote", "recover"}:
             raise ValueError(f"unsupported command: {command}")
         return Plan(
             command=command,
@@ -48,12 +54,15 @@ class SkillManager:
             full_diff=full_diff,
             validate_stable=validate_stable,
             validate_all=validate_all,
+            dry_run=dry_run,
         )
 
     def apply(self, plan: Plan) -> OperationReport:
         """Apply a non-mutating list Plan and return its common report."""
 
         started_at = utc_now()
+        transaction_id: str | None = None
+        changed = False
         if plan.command == "list":
             results = tuple(
                 Result(
@@ -78,7 +87,7 @@ class SkillManager:
                 plan.full_diff,
             )
             diagnostics = (*plan.scan.diagnostics, *diff_diagnostics)
-        else:
+        elif plan.command == "validate":
             results, validation_diagnostics = _validate_results(
                 plan.scan.candidates,
                 plan.skill,
@@ -87,14 +96,25 @@ class SkillManager:
                 self._repository_root,
             )
             diagnostics = (*plan.scan.diagnostics, *validation_diagnostics)
+        elif plan.command == "promote":
+            results, promotion_diagnostics = _promote_result(
+                plan.scan.candidates, plan.skill, self._repository_root, plan.dry_run
+            )
+            diagnostics = (*plan.scan.diagnostics, *promotion_diagnostics)
+            if results and results[0].outcome == "promoted":
+                transaction_id = results[0].details.get("transaction_id")
+                changed = True
+        else:
+            results, recovery_diagnostics = _recover_result(self._repository_root, plan.dry_run)
+            diagnostics = (*plan.scan.diagnostics, *recovery_diagnostics)
         return OperationReport(
             command=plan.command,
-            dry_run=False,
+            dry_run=plan.dry_run,
             status="failed"
             if any(diagnostic.severity == "error" for diagnostic in diagnostics)
             else "success",
-            changed=False,
-            transaction_id=None,
+            changed=changed,
+            transaction_id=transaction_id,
             started_at=started_at,
             finished_at=utc_now(),
             results=results,
@@ -195,6 +215,104 @@ def _status_results(
             )
         )
     return tuple(results), tuple(diagnostics)
+
+
+def _promote_result(candidates: tuple[Candidate, ...], skill_name: str | None, root: Path, dry_run: bool) -> tuple[tuple[Result, ...], tuple[Diagnostic, ...]]:
+    selected = next((candidate for candidate in candidates if candidate.source is CandidateSource.DEVELOPMENT and canonical_skill_name(candidate) == skill_name), None)
+    if selected is None:
+        return (), (Diagnostic("error", "PROMOTION_SOURCE_MISSING", f"development candidate not found: {skill_name}"),)
+    diagnostics = validate_candidate(selected, root)
+    if diagnostics:
+        return (Result("development", selected.name, str(selected.path), "invalid"),), diagnostics
+    skill = canonical_skill_name(selected)
+    assert skill is not None
+    if dry_run:
+        return (Result("development", selected.name, str(selected.path), "would-promote", {"test_state": "not-run"}),), ()
+    transactions = root / ".skill-manager" / "transactions"
+    if transactions.exists() and any(path.is_dir() for path in transactions.iterdir()):
+        return (), (Diagnostic("error", "RECOVERY_REQUIRED", "recover unfinished transaction before promotion"),)
+    test = run_skill_test(selected, root)
+    if test.diagnostics:
+        return (Result("development", selected.name, str(selected.path), "invalid", test.details),), test.diagnostics
+    manager_root = root / ".skill-manager"
+    transaction_id = str(uuid.uuid4())
+    transaction = manager_root / "transactions" / transaction_id
+    manager_root.mkdir(mode=0o700, exist_ok=True)
+    manager_root.chmod(0o700)
+    transactions.mkdir(mode=0o700, exist_ok=True)
+    transactions.chmod(0o700)
+    transaction.mkdir(mode=0o700)
+    transaction.chmod(0o700)
+    plan_path = transaction / "plan.json"
+    plan_hash = write_plan(plan_path, {"journal_schema_version": 1, "transaction_id": transaction_id, "skill": skill})
+    events = transaction / "events.jsonl"
+    append_event(events, plan_hash, "PREPARED")
+    stable = root / "skills" / skill
+    staging = transaction / "staging"
+    shutil.copytree(selected.path, staging, symlinks=True)
+    staging.chmod(0o700)
+    backup = transaction / "backup"
+    if stable.exists():
+        os.replace(stable, backup)
+        backup.chmod(0o700)
+    try:
+        append_event(events, plan_hash, "APPLYING")
+        os.replace(staging, stable)
+        _fsync_directory(stable.parent)
+    except OSError:
+        if backup.exists():
+            os.replace(backup, stable)
+        raise
+    append_event(events, plan_hash, "COMMITTED")
+    state = manager_root / "state.json"
+    state.write_text(json.dumps({"schema_version": 1, "receipts": {skill: {"identity": package_identity(stable), "transaction_id": transaction_id}}}, sort_keys=True), encoding="utf-8")
+    state.chmod(0o600)
+    shutil.rmtree(transaction)
+    return (Result("development", selected.name, str(selected.path), "promoted", {"stable_identity": package_identity(stable), "test_state": "passed", "transaction_id": transaction_id}),), ()
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _recover_result(root: Path, dry_run: bool) -> tuple[tuple[Result, ...], tuple[Diagnostic, ...]]:
+    transactions = root / ".skill-manager" / "transactions"
+    if not transactions.exists():
+        return (), ()
+    active = [path for path in transactions.iterdir() if path.is_dir()]
+    if len(active) > 1:
+        return (), (Diagnostic("error", "JOURNAL_CONFLICT", "multiple active transactions"),)
+    if not active:
+        return (), ()
+    transaction = active[0]
+    events = transaction / "events.jsonl"
+    try:
+        plan, plan_hash = read_plan(transaction / "plan.json")
+        events = read_events(events, plan_hash)
+    except JournalError as exc:
+        return (), (Diagnostic("error", "RECOVERY_REQUIRED", str(exc)),)
+    if events and events[-1]["type"] == "COMMITTED":
+        if dry_run:
+            return (Result("recovery", transaction.name, str(transaction), "would-clean"),), ()
+        shutil.rmtree(transaction)
+        return (Result("recovery", transaction.name, str(transaction), "cleaned"),), ()
+    if dry_run:
+        return (Result("recovery", transaction.name, str(transaction), "would-roll-back"),), ()
+    skill = plan.get("skill")
+    if not isinstance(skill, str):
+        return (), (Diagnostic("error", "RECOVERY_REQUIRED", "journal plan lacks Skill Name"),)
+    stable = root / "skills" / skill
+    backup = transaction / "backup"
+    if backup.exists():
+        if stable.exists():
+            shutil.rmtree(stable)
+        os.replace(backup, stable)
+    shutil.rmtree(transaction)
+    return (Result("recovery", transaction.name, str(transaction), "rolled-back"),), ()
 
 
 def _validate_results(

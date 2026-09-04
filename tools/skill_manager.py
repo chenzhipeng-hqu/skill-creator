@@ -35,6 +35,13 @@ def build_parser() -> argparse.ArgumentParser:
     validate_group.add_argument("--all", action="store_true", dest="validate_all")
     validate_parser.add_argument("--stable", action="store_true", dest="validate_stable")
     validate_parser.add_argument("--json", action="store_true", help="emit a JSON operation report")
+    promote_parser = subcommands.add_parser("promote", help="promote one Development Skill")
+    promote_parser.add_argument("skill", metavar="SKILL")
+    promote_parser.add_argument("--dry-run", action="store_true")
+    promote_parser.add_argument("--json", action="store_true")
+    recover_parser = subcommands.add_parser("recover", help="recover an unfinished promotion")
+    recover_parser.add_argument("--dry-run", action="store_true")
+    recover_parser.add_argument("--json", action="store_true")
     return parser
 
 
@@ -111,6 +118,7 @@ def main(
             full_diff=getattr(arguments, "full_diff", False),
             validate_stable=getattr(arguments, "validate_stable", False),
             validate_all=getattr(arguments, "validate_all", False),
+            dry_run=getattr(arguments, "dry_run", False),
         )
     )
 

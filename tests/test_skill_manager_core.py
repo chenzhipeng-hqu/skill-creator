@@ -13,6 +13,7 @@ from unittest.mock import patch
 from tools import skill_manager
 from tools.skill_manager_core import CandidateSource, SkillManager
 from tools.skill_manager_core import service as manager_service
+from tools.skill_manager_core.journal import append_event, write_plan
 
 
 class SkillManagerCoreTests(unittest.TestCase):
@@ -921,6 +922,75 @@ class SkillManagerCoreTests(unittest.TestCase):
             )
 
         self.assertIn("SKILL_TEST_TIMEOUT", [item.code for item in report.diagnostics])
+
+    def test_promote_copies_valid_development_to_stable_and_records_receipt(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n", encoding="utf-8"
+        )
+        (development / "guide.md").write_text("development", encoding="utf-8")
+
+        report = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan("promote", SkillManager(self.repository).scan(), skill="authoring")
+        )
+
+        self.assertEqual(report.status, "success")
+        self.assertTrue(report.changed)
+        self.assertIsNotNone(report.transaction_id)
+        self.assertEqual((self.repository / "skills" / "authoring" / "guide.md").read_text(), "development")
+        self.assertTrue((self.repository / ".skill-manager" / "state.json").is_file())
+
+    def test_recover_removes_completed_transaction_directory(self) -> None:
+        transaction = self.repository / ".skill-manager" / "transactions" / "test-id"
+        transaction.mkdir(parents=True)
+        plan_hash = write_plan(transaction / "plan.json", {"journal_schema_version": 1, "transaction_id": "test-id", "skill": "authoring"})
+        append_event(transaction / "events.jsonl", plan_hash, "COMMITTED")
+
+        report = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan("recover", SkillManager(self.repository).scan())
+        )
+
+        self.assertEqual(report.status, "success")
+        self.assertFalse(transaction.exists())
+
+    def test_promote_dry_run_does_not_create_manager_state_or_stable_copy(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n", encoding="utf-8"
+        )
+
+        report = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan(
+                "promote", SkillManager(self.repository).scan(), skill="authoring", dry_run=True
+            )
+        )
+
+        self.assertEqual(report.status, "success")
+        self.assertTrue(report.dry_run)
+        self.assertFalse((self.repository / ".skill-manager").exists())
+        self.assertFalse((self.repository / "skills" / "authoring").exists())
+
+    def test_recover_restores_backup_for_uncommitted_promotion(self) -> None:
+        stable = self.repository / "skills" / "authoring"
+        stable.mkdir()
+        (stable / "new.txt").write_text("new", encoding="utf-8")
+        transaction = self.repository / ".skill-manager" / "transactions" / "test-id"
+        transaction.mkdir(parents=True)
+        plan_hash = write_plan(transaction / "plan.json", {"journal_schema_version": 1, "transaction_id": "test-id", "skill": "authoring"})
+        append_event(transaction / "events.jsonl", plan_hash, "APPLYING")
+        backup = transaction / "backup"
+        backup.mkdir()
+        (backup / "old.txt").write_text("old", encoding="utf-8")
+
+        report = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan("recover", SkillManager(self.repository).scan())
+        )
+
+        self.assertEqual(report.results[0].outcome, "rolled-back")
+        self.assertEqual((stable / "old.txt").read_text(), "old")
+        self.assertFalse((stable / "new.txt").exists())
 
 
 if __name__ == "__main__":
