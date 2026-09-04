@@ -63,6 +63,14 @@ def run_skill_test(candidate: Candidate, repository_root: Path) -> SkillTestResu
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
             stdout, stderr = process.communicate()
+    except (InterruptedError, KeyboardInterrupt):
+        timed_out = True
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=TERMINATE_GRACE_SECONDS)
+        except (subprocess.TimeoutExpired, InterruptedError, KeyboardInterrupt):
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
     details = _write_logs(repository_root, skill_name, stdout, stderr)
     diagnostics: list[Diagnostic] = []
     state = "passed"

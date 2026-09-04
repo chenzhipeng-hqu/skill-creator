@@ -27,6 +27,10 @@ class AgentTarget:
 
         if not self.detected():
             return "target-not-detected"
+        if os.path.lexists(self.skills_root) and (
+            self.skills_root.is_symlink() or not self.skills_root.is_dir()
+        ):
+            return "target-root-conflict"
         destination = self.skills_root / stable.name
         if os.path.lexists(destination):
             return "no-change" if is_exact_managed_link(destination, stable) else "conflict"
@@ -38,8 +42,14 @@ class AgentTarget:
         """Remove only an exact managed link, preserving every other entry."""
 
         destination = self.skills_root / stable.name
-        if not destination.is_symlink():
+        if os.path.lexists(self.skills_root) and (
+            self.skills_root.is_symlink() or not self.skills_root.is_dir()
+        ):
+            return "target-root-conflict"
+        if not os.path.lexists(destination):
             return "no-change"
+        if not destination.is_symlink():
+            return "conflict"
         if not is_exact_managed_link(destination, stable):
             return "conflict"
         destination.unlink()
@@ -60,16 +70,27 @@ def hermes_target(home: Path, active_home: Path | None = None) -> AgentTarget:
     return AgentTarget("hermes", active_home or home / ".hermes")
 
 
-def opencode_target(home: Path, config_home: Path | None = None) -> AgentTarget:
+def opencode_target(
+    home: Path,
+    config_home: Path | None = None,
+    config_dir: Path | None = None,
+) -> AgentTarget:
     """Resolve the native OpenCode configuration root."""
 
-    return AgentTarget("opencode", (config_home or home / ".config") / "opencode")
+    return AgentTarget(
+        "opencode",
+        config_dir or (config_home or home / ".config") / "opencode",
+    )
 
 
-def opencode_discovery_roots(home: Path, config_home: Path | None = None) -> tuple[Path, ...]:
+def opencode_discovery_roots(
+    home: Path,
+    config_home: Path | None = None,
+    config_dir: Path | None = None,
+) -> tuple[Path, ...]:
     """Return native plus compatibility roots used for duplicate-exposure preflight."""
 
-    native = opencode_target(home, config_home).skills_root
+    native = opencode_target(home, config_home, config_dir).skills_root
     return native, home / ".agents" / "skills", home / ".claude" / "skills"
 
 
@@ -82,3 +103,24 @@ def is_exact_managed_link(destination: Path, stable: Path) -> bool:
         return destination.readlink().is_absolute() and destination.readlink() == stable
     except OSError:
         return False
+
+
+def apply_installation(target: AgentTarget, stable: Path, *, uninstall: bool = False, dry_run: bool = False) -> str:
+    """Plan-equivalent one-link operation used by CLI and TUI adapters."""
+
+    if not target.detected():
+        return "target-not-detected"
+    if os.path.lexists(target.skills_root) and (
+        target.skills_root.is_symlink() or not target.skills_root.is_dir()
+    ):
+        return "target-root-conflict"
+    destination = target.skills_root / stable.name
+    if dry_run:
+        if uninstall:
+            if is_exact_managed_link(destination, stable):
+                return "would-uninstall"
+            return "conflict" if os.path.lexists(destination) else "no-change"
+        if os.path.lexists(destination):
+            return "no-change" if is_exact_managed_link(destination, stable) else "conflict"
+        return "would-install"
+    return target.uninstall(stable) if uninstall else target.install(stable)

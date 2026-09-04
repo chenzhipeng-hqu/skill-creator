@@ -53,6 +53,7 @@ class OperationReport:
                     "path": result.path,
                     "outcome": result.outcome,
                     "details": result.details,
+                    **({"target": result.target} if result.target is not None else {}),
                 }
                 for result in self.results
             ],

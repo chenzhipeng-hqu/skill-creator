@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Sequence, TextIO
 
@@ -14,34 +16,59 @@ if __package__ in {None, ""}:
 
 from tools.skill_manager_core import SkillManager
 from tools.skill_manager_core.reporting import OperationReport
+from tools.skill_manager_core.tui import run_tui
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the initial non-interactive command parser."""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    subcommands = parser.add_subparsers(dest="command", required=True)
+    subcommands = parser.add_subparsers(dest="command")
+    tui_parser = subcommands.add_parser("tui", help="manage Agent installations interactively")
+    tui_parser.add_argument("--dry-run", action="store_true")
     list_parser = subcommands.add_parser("list", help="discover Skill candidates")
     list_parser.add_argument("--json", action="store_true", help="emit a JSON operation report")
     status_parser = subcommands.add_parser("status", help="report Skill lifecycle state")
+    status_parser.add_argument("skill", nargs="*", metavar="SKILL")
+    status_parser.add_argument(
+        "--agent",
+        action="append",
+        choices=("codex", "claude", "agents", "hermes", "opencode"),
+    )
     status_parser.add_argument("--json", action="store_true", help="emit a JSON operation report")
     diff_parser = subcommands.add_parser("diff", help="compare Development and Stable content")
-    diff_parser.add_argument("skill", metavar="SKILL", help="canonical Skill Name")
+    diff_parser.add_argument("skill", nargs="+", metavar="SKILL", help="canonical Skill Name")
     diff_parser.add_argument("--full", action="store_true", dest="full_diff", help="show all text hunks")
     diff_parser.add_argument("--json", action="store_true", help="emit a JSON operation report")
     validate_parser = subcommands.add_parser("validate", help="validate one Skill candidate")
     validate_group = validate_parser.add_mutually_exclusive_group(required=True)
-    validate_group.add_argument("skill", nargs="?", metavar="SKILL", help="canonical Skill Name")
+    validate_group.add_argument("skill", nargs="*", metavar="SKILL", help="canonical Skill Name")
     validate_group.add_argument("--all", action="store_true", dest="validate_all")
     validate_parser.add_argument("--stable", action="store_true", dest="validate_stable")
     validate_parser.add_argument("--json", action="store_true", help="emit a JSON operation report")
-    promote_parser = subcommands.add_parser("promote", help="promote one Development Skill")
-    promote_parser.add_argument("skill", metavar="SKILL")
+    promote_parser = subcommands.add_parser("promote", help="promote Development Skills")
+    promote_parser.add_argument("skill", nargs="*", metavar="SKILL")
+    promote_parser.add_argument("--all", action="store_true", dest="promote_all")
+    promote_parser.add_argument("--replace-stable-drift", action="store_true")
+    promote_parser.add_argument("--record-release", action="store_true")
+    promote_parser.add_argument(
+        "--commit-message-file",
+        action="append",
+        default=[],
+        metavar="SKILL=PATH",
+    )
     promote_parser.add_argument("--dry-run", action="store_true")
     promote_parser.add_argument("--json", action="store_true")
     recover_parser = subcommands.add_parser("recover", help="recover an unfinished promotion")
     recover_parser.add_argument("--dry-run", action="store_true")
     recover_parser.add_argument("--json", action="store_true")
+    for command, help_text in (("install", "install Stable Skills"), ("uninstall", "uninstall managed Stable Skill links")):
+        operation_parser = subcommands.add_parser(command, help=help_text)
+        operation_parser.add_argument("skill", nargs="*", metavar="SKILL")
+        operation_parser.add_argument("--all", action="store_true", dest="install_all")
+        operation_parser.add_argument("--agent", action="append", required=True, choices=("codex", "claude", "agents", "hermes", "opencode"))
+        operation_parser.add_argument("--dry-run", action="store_true")
+        operation_parser.add_argument("--json", action="store_true")
     return parser
 
 
@@ -102,32 +129,89 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     repository_root: Path | None = None,
+    home: Path | None = None,
+    stdin: TextIO | None = None,
     stdout: TextIO | None = None,
 ) -> int:
     """Run the initial list command through the typed core."""
 
-    arguments = build_parser().parse_args(argv)
+    parser = build_parser()
+    arguments = parser.parse_args(argv)
     output = stdout or sys.stdout
     root = repository_root or Path(__file__).resolve().parents[1]
-    manager = SkillManager(root)
-    report = manager.apply(
-        manager.plan(
-            arguments.command,
-            manager.scan(),
-            skill=getattr(arguments, "skill", None),
-            full_diff=getattr(arguments, "full_diff", False),
-            validate_stable=getattr(arguments, "validate_stable", False),
-            validate_all=getattr(arguments, "validate_all", False),
-            dry_run=getattr(arguments, "dry_run", False),
+    manager = SkillManager(root, home=home)
+    if arguments.command in {None, "tui"}:
+        with _termination_as_operation_error():
+            return run_tui(
+                manager,
+                stdin or sys.stdin,
+                output,
+                dry_run=getattr(arguments, "dry_run", False),
+            )
+    if arguments.command in {"install", "uninstall"} and (
+        bool(arguments.skill) == bool(arguments.install_all)
+    ):
+        parser.error("select SKILL... or --all, but not both")
+    if arguments.command == "promote" and (
+        bool(arguments.skill) == bool(arguments.promote_all)
+    ):
+        parser.error("select SKILL... or --all, but not both")
+    if arguments.command == "validate" and (
+        bool(arguments.skill) == bool(arguments.validate_all)
+    ):
+        parser.error("select SKILL... or --all, but not both")
+    if arguments.command == "promote" and bool(arguments.commit_message_file) != bool(arguments.record_release):
+        parser.error("--commit-message-file requires --record-release and vice versa")
+    raw_skill = getattr(arguments, "skill", None)
+    scalar_skill = raw_skill if isinstance(raw_skill, str) else None
+    selected_skills = tuple(raw_skill) if isinstance(raw_skill, list) else ()
+    with _termination_as_operation_error():
+        report = manager.apply(
+            manager.plan(
+                arguments.command,
+                manager.scan(),
+                skill=scalar_skill,
+                full_diff=getattr(arguments, "full_diff", False),
+                validate_stable=getattr(arguments, "validate_stable", False),
+                validate_all=getattr(arguments, "validate_all", False),
+                dry_run=getattr(arguments, "dry_run", False),
+                skills=selected_skills,
+                agents=tuple(getattr(arguments, "agent", ()) or ()),
+                select_all=(
+                    getattr(arguments, "install_all", False)
+                    or getattr(arguments, "promote_all", False)
+                ),
+                replace_stable_drift=getattr(arguments, "replace_stable_drift", False),
+                record_release=getattr(arguments, "record_release", False),
+                commit_message_files=tuple(getattr(arguments, "commit_message_file", ())),
+            )
         )
-    )
 
     if arguments.json:
         print(json.dumps(report.to_json_object(), sort_keys=True), file=output)
-        return 1 if report.status == "failed" else 0
+        return 0 if report.status in {"success", "no-change"} else 1
 
     write_human_report(report, output)
-    return 1 if report.status == "failed" else 0
+    return 0 if report.status in {"success", "no-change"} else 1
+
+
+@contextmanager
+def _termination_as_operation_error():
+    """Turn interactive termination into a caught transaction failure."""
+
+    previous: dict[int, object] = {}
+
+    def interrupt(signum: int, frame: object) -> None:
+        raise InterruptedError(f"received signal {signum}")
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, interrupt)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

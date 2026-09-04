@@ -52,6 +52,12 @@ class Plan:
     validate_stable: bool = False
     validate_all: bool = False
     dry_run: bool = False
+    skills: tuple[str, ...] = ()
+    agents: tuple[str, ...] = ()
+    select_all: bool = False
+    replace_stable_drift: bool = False
+    record_release: bool = False
+    commit_message_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -62,4 +68,5 @@ class Result:
     skill: str
     path: str
     outcome: str
-    details: dict[str, str] = field(default_factory=dict)
+    details: dict[str, object] = field(default_factory=dict)
+    target: str | None = None

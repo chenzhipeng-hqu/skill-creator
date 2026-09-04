@@ -27,6 +27,7 @@ def write_plan(path: Path, plan: dict[str, object]) -> str:
         file.flush()
         os.fsync(file.fileno())
     path.chmod(0o600)
+    _fsync_directory(path.parent)
     return payload["plan_sha256"]
 
 
@@ -41,28 +42,47 @@ def read_plan(path: Path) -> tuple[dict[str, object], str]:
     return payload, stored
 
 
-def append_event(path: Path, plan_hash: str, event_type: str) -> None:
+def append_event(
+    path: Path,
+    plan_hash: str,
+    event_type: str,
+    details: dict[str, object] | None = None,
+) -> None:
     previous = plan_hash
     sequence = 1
     if path.exists():
+        raw = path.read_bytes()
+        if raw and not raw.endswith(b"\n"):
+            complete_length = raw.rfind(b"\n") + 1
+            with path.open("r+b") as file:
+                file.truncate(complete_length)
+                file.flush()
+                os.fsync(file.fileno())
         events = read_events(path, plan_hash)
         if events:
             previous = events[-1]["event_sha256"]
             sequence = int(events[-1]["sequence"]) + 1
     event = {"sequence": sequence, "prior_sha256": previous, "type": event_type}
+    if details is not None:
+        event["details"] = details
     event["event_sha256"] = sha256(event)
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
         file.flush()
         os.fsync(file.fileno())
     path.chmod(0o600)
+    _fsync_directory(path.parent)
 
 
 def read_events(path: Path, plan_hash: str) -> list[dict[str, object]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
         raise JournalError(f"invalid events: {exc}") from exc
+    lines = text.splitlines()
+    if raw and not raw.endswith(b"\n"):
+        lines = lines[:-1]
     events: list[dict[str, object]] = []
     prior = plan_hash
     for sequence, line in enumerate(lines, 1):
@@ -77,3 +97,11 @@ def read_events(path: Path, plan_hash: str) -> list[dict[str, object]]:
         events.append(event)
         prior = stored
     return events
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
