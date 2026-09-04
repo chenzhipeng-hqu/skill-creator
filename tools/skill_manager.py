@@ -29,6 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
     diff_parser.add_argument("skill", metavar="SKILL", help="canonical Skill Name")
     diff_parser.add_argument("--full", action="store_true", dest="full_diff", help="show all text hunks")
     diff_parser.add_argument("--json", action="store_true", help="emit a JSON operation report")
+    validate_parser = subcommands.add_parser("validate", help="validate one Skill candidate")
+    validate_group = validate_parser.add_mutually_exclusive_group(required=True)
+    validate_group.add_argument("skill", nargs="?", metavar="SKILL", help="canonical Skill Name")
+    validate_group.add_argument("--all", action="store_true", dest="validate_all")
+    validate_parser.add_argument("--stable", action="store_true", dest="validate_stable")
+    validate_parser.add_argument("--json", action="store_true", help="emit a JSON operation report")
     return parser
 
 
@@ -103,6 +109,8 @@ def main(
             manager.scan(),
             skill=getattr(arguments, "skill", None),
             full_diff=getattr(arguments, "full_diff", False),
+            validate_stable=getattr(arguments, "validate_stable", False),
+            validate_all=getattr(arguments, "validate_all", False),
         )
     )
 

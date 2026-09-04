@@ -49,6 +49,8 @@ class Plan:
     scan: Scan
     skill: str | None = None
     full_diff: bool = False
+    validate_stable: bool = False
+    validate_all: bool = False
 
 
 @dataclass(frozen=True)

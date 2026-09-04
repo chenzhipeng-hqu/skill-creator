@@ -9,6 +9,7 @@ from .discovery import scan_repository
 from .identity import IdentityError, canonical_skill_name, package_identity, package_manifest
 from .model import Candidate, CandidateSource, Diagnostic, Plan, Result, Scan
 from .reporting import OperationReport, utc_now
+from .validation import validate_candidate
 
 
 TEXT_DIFF_MAX_BYTES = 1024 * 1024
@@ -32,12 +33,21 @@ class SkillManager:
         scan: Scan,
         skill: str | None = None,
         full_diff: bool = False,
+        validate_stable: bool = False,
+        validate_all: bool = False,
     ) -> Plan:
         """Prepare one typed command from a Scan."""
 
-        if command not in {"list", "status", "diff"}:
+        if command not in {"list", "status", "diff", "validate"}:
             raise ValueError(f"unsupported command: {command}")
-        return Plan(command=command, scan=scan, skill=skill, full_diff=full_diff)
+        return Plan(
+            command=command,
+            scan=scan,
+            skill=skill,
+            full_diff=full_diff,
+            validate_stable=validate_stable,
+            validate_all=validate_all,
+        )
 
     def apply(self, plan: Plan) -> OperationReport:
         """Apply a non-mutating list Plan and return its common report."""
@@ -55,15 +65,27 @@ class SkillManager:
             )
             diagnostics = plan.scan.diagnostics
         elif plan.command == "status":
-            results, status_diagnostics = _status_results(plan.scan.candidates)
+            results, status_diagnostics = _status_results(
+                plan.scan.candidates,
+                self._repository_root,
+            )
             diagnostics = (*plan.scan.diagnostics, *status_diagnostics)
-        else:
+        elif plan.command == "diff":
             results, diff_diagnostics = _diff_results(
                 plan.scan.candidates,
                 plan.skill,
                 plan.full_diff,
             )
             diagnostics = (*plan.scan.diagnostics, *diff_diagnostics)
+        else:
+            results, validation_diagnostics = _validate_results(
+                plan.scan.candidates,
+                plan.skill,
+                plan.validate_stable,
+                plan.validate_all,
+                self._repository_root,
+            )
+            diagnostics = (*plan.scan.diagnostics, *validation_diagnostics)
         return OperationReport(
             command=plan.command,
             dry_run=False,
@@ -81,6 +103,7 @@ class SkillManager:
 
 def _status_results(
     candidates: tuple[Candidate, ...],
+    repository_root: Path,
 ) -> tuple[tuple[Result, ...], tuple[Diagnostic, ...]]:
     results: list[Result] = []
     diagnostics: list[Diagnostic] = []
@@ -116,9 +139,13 @@ def _status_results(
         development = copies.get(CandidateSource.DEVELOPMENT)
         stable = copies.get(CandidateSource.STABLE)
         identities: dict[str, str] = {}
+        structural_diagnostics: dict[str, tuple[Diagnostic, ...]] = {}
         for source, candidate in (("development", development), ("stable", stable)):
             if candidate is None:
                 continue
+            candidate_diagnostics = validate_candidate(candidate, repository_root)
+            structural_diagnostics[source] = candidate_diagnostics
+            diagnostics.extend(candidate_diagnostics)
             try:
                 identities[source] = package_identity(candidate.path)
             except (IdentityError, OSError) as exc:
@@ -147,7 +174,18 @@ def _status_results(
                 path=str(path),
                 outcome=lifecycle,
                 details={
-                    "validation_state": "not-run",
+                    "validation_state": (
+                        "invalid"
+                        if any(structural_diagnostics.values())
+                        else "valid"
+                    ),
+                    "test_state": "not-run",
+                    **{
+                        f"{source}_validation_state": (
+                            "invalid" if source_diagnostics else "valid"
+                        )
+                        for source, source_diagnostics in structural_diagnostics.items()
+                    },
                     **{
                         f"{source}_identity": identity
                         for source, identity in identities.items()
@@ -156,6 +194,62 @@ def _status_results(
             )
         )
     return tuple(results), tuple(diagnostics)
+
+
+def _validate_results(
+    candidates: tuple[Candidate, ...],
+    skill_name: str | None,
+    validate_stable: bool,
+    validate_all: bool,
+    repository_root: Path,
+) -> tuple[tuple[Result, ...], tuple[Diagnostic, ...]]:
+    source = CandidateSource.STABLE if validate_stable else CandidateSource.DEVELOPMENT
+    selected = [
+        candidate
+        for candidate in candidates
+        if candidate.source is source
+        and (validate_all or _matches_validation_selection(candidate, skill_name))
+    ]
+    selected.sort(key=lambda candidate: candidate.name)
+    if not selected:
+        return (), (
+            Diagnostic(
+                severity="error",
+                code="VALIDATION_SOURCE_MISSING",
+                message=f"{source.value} candidate not found: {skill_name}",
+            ),
+        )
+    results: list[Result] = []
+    diagnostics: list[Diagnostic] = []
+    for candidate in selected:
+        candidate_diagnostics = validate_candidate(candidate, repository_root)
+        diagnostics.extend(candidate_diagnostics)
+        results.append(
+            Result(
+                source=candidate.source.value,
+                skill=candidate.name,
+                path=str(candidate.path),
+                outcome="valid" if not candidate_diagnostics else "invalid",
+                details={
+                    "validation_state": "valid" if not candidate_diagnostics else "invalid"
+                },
+            )
+        )
+    return tuple(results), tuple(diagnostics)
+
+
+def _matches_validation_selection(candidate: Candidate, skill_name: str | None) -> bool:
+    """Select explicit invalid candidates before canonical-name validation."""
+
+    if skill_name is None:
+        return False
+    return skill_name in {
+        candidate.name,
+        canonical_skill_name(candidate),
+        f"sk-{candidate.name}"
+        if candidate.source is CandidateSource.DEVELOPMENT
+        else candidate.name,
+    }
 
 
 def _diff_results(

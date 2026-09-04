@@ -28,6 +28,11 @@ class SkillManagerCoreTests(unittest.TestCase):
             "---\nname: released\ndescription: Stable candidate.\n---\n",
             encoding="utf-8",
         )
+        (self.repository / "skills" / "released" / "agents").mkdir()
+        (self.repository / "skills" / "released" / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Released\n  short_description: Stable candidate\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -138,6 +143,8 @@ class SkillManagerCoreTests(unittest.TestCase):
         stable_namespace = self.repository / "skills"
         released = stable_namespace / "released"
         (released / "SKILL.md").unlink()
+        (released / "agents" / "openai.yaml").unlink()
+        (released / "agents").rmdir()
         released.rmdir()
         stable_namespace.rmdir()
         external_stable = self.repository / "external-stable"
@@ -209,7 +216,8 @@ class SkillManagerCoreTests(unittest.TestCase):
 
         authoring = next(result for result in report.results if result.skill == "authoring")
         self.assertEqual(authoring.outcome, "promoted-clean")
-        self.assertEqual(authoring.details["validation_state"], "not-run")
+        self.assertEqual(authoring.details["validation_state"], "invalid")
+        self.assertEqual(authoring.details["test_state"], "not-run")
         self.assertEqual(
             authoring.details["development_identity"],
             authoring.details["stable_identity"],
@@ -236,12 +244,47 @@ class SkillManagerCoreTests(unittest.TestCase):
         self.assertEqual(outcomes["authoring"], "unpublished")
         self.assertEqual(outcomes["released"], "stable")
 
+    def test_status_reports_structural_validation_without_running_tests(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        metadata = development / "agents" / "openai.yaml"
+        metadata.write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n",
+            encoding="utf-8",
+        )
+        manager = SkillManager(self.repository)
+
+        valid_report = manager.apply(manager.plan("status", manager.scan()))
+        metadata.unlink()
+        invalid_report = manager.apply(manager.plan("status", manager.scan()))
+
+        valid_authoring = next(result for result in valid_report.results if result.skill == "authoring")
+        invalid_authoring = next(
+            result for result in invalid_report.results if result.skill == "authoring"
+        )
+        self.assertEqual(valid_authoring.details["validation_state"], "valid")
+        self.assertEqual(invalid_authoring.details["validation_state"], "invalid")
+        self.assertIn(
+            "MISSING_OPENAI_METADATA",
+            [diagnostic.code for diagnostic in invalid_report.diagnostics],
+        )
+
     def test_status_json_reports_lifecycle_details(self) -> None:
         development = self.repository / "sk-authoring"
         stable = self.repository / "skills" / "authoring"
         stable.mkdir()
         (stable / "SKILL.md").write_text(
             (development / "SKILL.md").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n",
+            encoding="utf-8",
+        )
+        (stable / "agents").mkdir()
+        (stable / "agents" / "openai.yaml").write_text(
+            (development / "agents" / "openai.yaml").read_text(encoding="utf-8"),
             encoding="utf-8",
         )
         stdout = io.StringIO()
@@ -256,7 +299,7 @@ class SkillManagerCoreTests(unittest.TestCase):
         authoring = next(item for item in payload["results"] if item["skill"] == "authoring")
         self.assertEqual(exit_code, 0)
         self.assertEqual(authoring["outcome"], "promoted-clean")
-        self.assertEqual(authoring["details"]["validation_state"], "not-run")
+        self.assertEqual(authoring["details"]["validation_state"], "valid")
 
     def test_diff_reports_added_removed_and_modified_managed_files(self) -> None:
         development = self.repository / "sk-authoring"
@@ -503,6 +546,300 @@ class SkillManagerCoreTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertIn("file type: stable=regular development=symlink", stdout.getvalue())
+
+    def test_validate_selects_development_and_reports_missing_openai_metadata(self) -> None:
+        manager = SkillManager(self.repository)
+
+        report = manager.apply(
+            manager.plan("validate", manager.scan(), skill="authoring")
+        )
+
+        self.assertEqual(report.status, "failed")
+        self.assertEqual(
+            [diagnostic.code for diagnostic in report.diagnostics],
+            ["MISSING_OPENAI_METADATA"],
+        )
+
+    def test_validate_stable_selects_only_the_stable_candidate(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir(exist_ok=True)
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n",
+            encoding="utf-8",
+        )
+        stable = self.repository / "skills" / "authoring"
+        stable.mkdir()
+        (stable / "SKILL.md").write_text(
+            (development / "SKILL.md").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        (stable / "agents").mkdir()
+        (stable / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n",
+            encoding="utf-8",
+        )
+
+        manager = SkillManager(self.repository)
+        development_report = manager.apply(
+            manager.plan("validate", manager.scan(), skill="authoring")
+        )
+        stable_report = manager.apply(
+            manager.plan(
+                "validate",
+                manager.scan(),
+                skill="authoring",
+                validate_stable=True,
+            )
+        )
+
+        self.assertEqual(development_report.status, "success")
+        self.assertEqual(stable_report.status, "failed")
+        self.assertIn(
+            "INVALID_OPENAI_METADATA",
+            [diagnostic.code for diagnostic in stable_report.diagnostics],
+        )
+
+    def test_validate_all_reports_each_development_candidate(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir(exist_ok=True)
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n",
+            encoding="utf-8",
+        )
+        (self.repository / "sk-broken").mkdir()
+
+        manager = SkillManager(self.repository)
+        report = manager.apply(
+            manager.plan("validate", manager.scan(), validate_all=True)
+        )
+
+        self.assertEqual(report.status, "failed")
+        self.assertEqual(
+            [result.skill for result in report.results],
+            ["sk-authoring", "sk-broken"],
+        )
+        self.assertIn("MISSING_SKILL_MD", [diagnostic.code for diagnostic in report.diagnostics])
+
+    def test_validate_reports_missing_local_markdown_reference(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n",
+            encoding="utf-8",
+        )
+        (development / "SKILL.md").write_text(
+            "---\nname: authoring\ndescription: Development candidate.\n---\n"
+            "\n[Missing guide](references/guide.md)\n"
+            "\n[External](https://example.com)\n",
+            encoding="utf-8",
+        )
+
+        manager = SkillManager(self.repository)
+        report = manager.apply(manager.plan("validate", manager.scan(), skill="authoring"))
+
+        self.assertEqual(report.status, "failed")
+        self.assertIn(
+            "MISSING_LOCAL_REFERENCE",
+            [diagnostic.code for diagnostic in report.diagnostics],
+        )
+
+    def test_validate_rejects_known_metadata_type_errors_but_warns_unknown_fields(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n"
+            "brand_color: blue\n"
+            "future_field: accepted-later\n",
+            encoding="utf-8",
+        )
+
+        manager = SkillManager(self.repository)
+        report = manager.apply(manager.plan("validate", manager.scan(), skill="authoring"))
+
+        self.assertEqual(report.status, "failed")
+        codes = [diagnostic.code for diagnostic in report.diagnostics]
+        self.assertIn("INVALID_OPENAI_METADATA", codes)
+        self.assertIn("UNKNOWN_OPENAI_METADATA_FIELD", codes)
+
+    def test_validate_rejects_symlinks_and_executable_script_without_shebang(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n",
+            encoding="utf-8",
+        )
+        target = self.repository / "outside"
+        target.write_text("outside", encoding="utf-8")
+        (development / "linked.txt").symlink_to(target)
+        script = development / "scripts" / "run"
+        script.parent.mkdir()
+        script.write_text("echo missing shebang\n", encoding="utf-8")
+        script.chmod(0o755)
+
+        manager = SkillManager(self.repository)
+        report = manager.apply(manager.plan("validate", manager.scan(), skill="authoring"))
+
+        codes = [diagnostic.code for diagnostic in report.diagnostics]
+        self.assertIn("SYMBOLIC_LINK_NOT_ALLOWED", codes)
+        self.assertIn("INVALID_SCRIPT_SHEBANG", codes)
+
+    def test_validate_requires_test_entrypoint_for_managed_scripts(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n",
+            encoding="utf-8",
+        )
+        script = development / "scripts" / "check"
+        script.parent.mkdir()
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o755)
+
+        manager = SkillManager(self.repository)
+        report = manager.apply(manager.plan("validate", manager.scan(), skill="authoring"))
+
+        self.assertIn(
+            "MISSING_SKILL_TEST_ENTRYPOINT",
+            [diagnostic.code for diagnostic in report.diagnostics],
+        )
+
+    def test_validate_checks_icon_containment_and_dependency_tool_shape(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n"
+            "icon_small: ../outside.png\n"
+            "dependencies:\n  tools:\n    - type: unsupported\n      value: x\n"
+            "    - type: mcp\n      value: server\n      optional: true\n",
+            encoding="utf-8",
+        )
+
+        manager = SkillManager(self.repository)
+        report = manager.apply(manager.plan("validate", manager.scan(), skill="authoring"))
+
+        self.assertIn(
+            "INVALID_OPENAI_METADATA",
+            [diagnostic.code for diagnostic in report.diagnostics],
+        )
+
+    def test_validate_does_not_follow_symlinks_for_local_references_or_icons(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n"
+            "icon_small: assets/icon.png\n",
+            encoding="utf-8",
+        )
+        outside = self.repository / "outside"
+        outside.mkdir()
+        (outside / "guide.md").write_text("outside", encoding="utf-8")
+        (outside / "icon.png").write_bytes(b"outside")
+        (development / "assets").symlink_to(outside, target_is_directory=True)
+        (development / "SKILL.md").write_text(
+            "---\nname: authoring\ndescription: Development candidate.\n---\n"
+            "\n[Guide](assets/guide.md)\n",
+            encoding="utf-8",
+        )
+
+        manager = SkillManager(self.repository)
+        report = manager.apply(manager.plan("validate", manager.scan(), skill="authoring"))
+
+        codes = [diagnostic.code for diagnostic in report.diagnostics]
+        self.assertIn("SYMBOLIC_LINK_NOT_ALLOWED", codes)
+        self.assertIn("INVALID_OPENAI_METADATA", codes)
+        self.assertIn("MISSING_LOCAL_REFERENCE", codes)
+
+    def test_validate_rejects_version_control_metadata_and_bad_dependency_field_types(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n"
+            "dependencies:\n  tools:\n    - type: mcp\n      value: server\n"
+            "      description: 1\n",
+            encoding="utf-8",
+        )
+        (development / ".git").mkdir()
+
+        manager = SkillManager(self.repository)
+        report = manager.apply(manager.plan("validate", manager.scan(), skill="authoring"))
+
+        codes = [diagnostic.code for diagnostic in report.diagnostics]
+        self.assertIn("VERSION_CONTROL_METADATA_NOT_ALLOWED", codes)
+        self.assertIn("INVALID_OPENAI_METADATA", codes)
+
+    def test_validate_reports_invalid_frontmatter_instead_of_raising(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n",
+            encoding="utf-8",
+        )
+        (development / "SKILL.md").write_text(
+            "---\nname: [authoring\ndescription: broken\n---\n",
+            encoding="utf-8",
+        )
+
+        report = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan(
+                "validate", SkillManager(self.repository).scan(), skill="authoring"
+            )
+        )
+
+        self.assertEqual(report.status, "failed")
+        self.assertIn("INVALID_SKILL_MD", [diagnostic.code for diagnostic in report.diagnostics])
+
+    def test_validate_named_invalid_candidate_is_reported_instead_of_skipped(self) -> None:
+        invalid = self.repository / "skills" / "bad--name"
+        invalid.mkdir()
+
+        report = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan(
+                "validate",
+                SkillManager(self.repository).scan(),
+                skill="bad--name",
+                validate_stable=True,
+            )
+        )
+
+        self.assertEqual(report.status, "failed")
+        self.assertEqual([(result.skill, result.outcome) for result in report.results], [("bad--name", "invalid")])
+        self.assertIn("INVALID_SKILL_NAME", [diagnostic.code for diagnostic in report.diagnostics])
+
+    def test_validate_rejects_non_nfc_managed_path(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n",
+            encoding="utf-8",
+        )
+        (development / "é.md").write_text("decomposed", encoding="utf-8")
+
+        report = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan(
+                "validate", SkillManager(self.repository).scan(), skill="authoring"
+            )
+        )
+
+        self.assertEqual(report.status, "failed")
+        self.assertIn("INVALID_MANAGED_PATH", [diagnostic.code for diagnostic in report.diagnostics])
+
+    def test_validate_rejects_icon_that_names_the_skill_directory(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n"
+            "icon_small: .\n",
+            encoding="utf-8",
+        )
+
+        report = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan(
+                "validate", SkillManager(self.repository).scan(), skill="authoring"
+            )
+        )
+
+        self.assertEqual(report.status, "failed")
+        self.assertIn("INVALID_OPENAI_METADATA", [diagnostic.code for diagnostic in report.diagnostics])
 
 
 if __name__ == "__main__":
