@@ -15,6 +15,8 @@ from tools.skill_manager_core import CandidateSource, SkillManager
 from tools.skill_manager_core import service as manager_service
 from tools.skill_manager_core.journal import append_event, write_plan
 from tools.skill_manager_core.targets import AgentTarget, hermes_target, is_exact_managed_link, opencode_discovery_roots
+from tools.skill_manager_core.provenance import stable_provenance
+from tools.skill_manager_core.identity import package_identity
 
 
 class SkillManagerCoreTests(unittest.TestCase):
@@ -97,6 +99,21 @@ class SkillManagerCoreTests(unittest.TestCase):
             opencode_discovery_roots(home),
             (home / ".config" / "opencode" / "skills", home / ".agents" / "skills", home / ".claude" / "skills"),
         )
+
+    def test_stable_provenance_classifies_clean_drifted_and_unknown(self) -> None:
+        stable = self.repository / "skills" / "authoring"
+        stable.mkdir(exist_ok=True)
+        (stable / "SKILL.md").write_text("stable", encoding="utf-8")
+        state = self.repository / ".skill-manager"
+        state.mkdir()
+        (state / "state.json").write_text(
+            json.dumps({"receipts": {"authoring": {"identity": package_identity(stable)}}}), encoding="utf-8"
+        )
+
+        self.assertEqual(stable_provenance(self.repository, "authoring", stable), "clean")
+        (stable / "SKILL.md").write_text("drifted", encoding="utf-8")
+        self.assertEqual(stable_provenance(self.repository, "authoring", stable), "drifted")
+        self.assertEqual(stable_provenance(self.repository, "other", stable), "unknown")
 
     def test_list_json_uses_the_common_versioned_report_envelope(self) -> None:
         stdout = io.StringIO()
