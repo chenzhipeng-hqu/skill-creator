@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import datetime
 import subprocess
 import stat
 import sys
@@ -17,6 +18,7 @@ from tools.skill_manager_core.journal import append_event, write_plan
 from tools.skill_manager_core.targets import AgentTarget, hermes_target, is_exact_managed_link, opencode_discovery_roots
 from tools.skill_manager_core.provenance import stable_provenance
 from tools.skill_manager_core.identity import package_identity
+from tools.skill_manager_core.release import release_tag_name
 
 
 class SkillManagerCoreTests(unittest.TestCase):
@@ -114,6 +116,14 @@ class SkillManagerCoreTests(unittest.TestCase):
         (stable / "SKILL.md").write_text("drifted", encoding="utf-8")
         self.assertEqual(stable_provenance(self.repository, "authoring", stable), "drifted")
         self.assertEqual(stable_provenance(self.repository, "other", stable), "unknown")
+
+    def test_release_tag_uses_greatest_existing_daily_version(self) -> None:
+        instant = datetime(2026, 9, 4)
+
+        self.assertEqual(
+            release_tag_name("authoring", instant, {"authoring-260904-v1", "authoring-260904-v3"}),
+            "authoring-260904-v4",
+        )
 
     def test_list_json_uses_the_common_versioned_report_envelope(self) -> None:
         stdout = io.StringIO()
