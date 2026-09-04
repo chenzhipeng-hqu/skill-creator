@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -47,6 +47,8 @@ class Plan:
 
     command: str
     scan: Scan
+    skill: str | None = None
+    full_diff: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,3 +59,4 @@ class Result:
     skill: str
     path: str
     outcome: str
+    details: dict[str, str] = field(default_factory=dict)

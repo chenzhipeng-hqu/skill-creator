@@ -52,6 +52,7 @@ class OperationReport:
                     "skill": result.skill,
                     "path": result.path,
                     "outcome": result.outcome,
+                    "details": result.details,
                 }
                 for result in self.results
             ],

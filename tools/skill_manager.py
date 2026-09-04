@@ -23,6 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
     list_parser = subcommands.add_parser("list", help="discover Skill candidates")
     list_parser.add_argument("--json", action="store_true", help="emit a JSON operation report")
+    status_parser = subcommands.add_parser("status", help="report Skill lifecycle state")
+    status_parser.add_argument("--json", action="store_true", help="emit a JSON operation report")
+    diff_parser = subcommands.add_parser("diff", help="compare Development and Stable content")
+    diff_parser.add_argument("skill", metavar="SKILL", help="canonical Skill Name")
+    diff_parser.add_argument("--full", action="store_true", dest="full_diff", help="show all text hunks")
+    diff_parser.add_argument("--json", action="store_true", help="emit a JSON operation report")
     return parser
 
 
@@ -34,8 +40,15 @@ def write_human_report(report: OperationReport, output: TextIO) -> None:
     print(f"Changed: {'yes' if report.changed else 'no'}", file=output)
     print("Results:", file=output)
     if report.results:
-        for result in report.results:
-            print(f"  {result.source:<11} {result.skill:<32} {result.path}", file=output)
+        if report.command == "diff":
+            _write_human_diff(report, output)
+        else:
+            for result in report.results:
+                print(
+                    f"  {result.source:<11} {result.skill:<32} "
+                    f"{result.outcome:<18} {result.path}",
+                    file=output,
+                )
     else:
         print("  (none)", file=output)
     if not report.diagnostics:
@@ -44,6 +57,32 @@ def write_human_report(report: OperationReport, output: TextIO) -> None:
     print("Diagnostics:", file=output)
     for diagnostic in report.diagnostics:
         print(f"  {diagnostic.severity} {diagnostic.code}: {diagnostic.message}", file=output)
+
+
+def _write_human_diff(report: OperationReport, output: TextIO) -> None:
+    for result in report.results:
+        print(f"  {result.path}: {result.outcome}", file=output)
+        if result.details.get("content_kind") == "binary":
+            print(
+                "    binary "
+                f"stable={result.details.get('stable_size')}:{result.details.get('stable_sha256')} "
+                f"development={result.details.get('development_size')}:{result.details.get('development_sha256')}",
+                file=output,
+            )
+        if result.details.get("executable_changed") == "true":
+            print("    executable bit changed", file=output)
+        if result.outcome == "file-type-changed":
+            print(
+                "    file type: "
+                f"stable={result.details.get('stable_type')} "
+                f"development={result.details.get('development_type')}",
+                file=output,
+            )
+        unified_diff = result.details.get("unified_diff")
+        if unified_diff:
+            print(unified_diff, end="" if unified_diff.endswith("\n") else "\n", file=output)
+        if result.details.get("diff_truncated") == "true":
+            print("    text hunk truncated; run diff --full for all text", file=output)
 
 
 def main(
@@ -58,7 +97,14 @@ def main(
     output = stdout or sys.stdout
     root = repository_root or Path(__file__).resolve().parents[1]
     manager = SkillManager(root)
-    report = manager.apply(manager.plan(arguments.command, manager.scan()))
+    report = manager.apply(
+        manager.plan(
+            arguments.command,
+            manager.scan(),
+            skill=getattr(arguments, "skill", None),
+            full_diff=getattr(arguments, "full_diff", False),
+        )
+    )
 
     if arguments.json:
         print(json.dumps(report.to_json_object(), sort_keys=True), file=output)
