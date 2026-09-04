@@ -992,6 +992,72 @@ class SkillManagerCoreTests(unittest.TestCase):
         self.assertEqual((stable / "old.txt").read_text(), "old")
         self.assertFalse((stable / "new.txt").exists())
 
+    def test_promote_all_rejects_batch_without_writing_when_one_skill_invalid(self) -> None:
+        valid = self.repository / "sk-authoring"
+        (valid / "agents").mkdir()
+        (valid / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n", encoding="utf-8"
+        )
+        (self.repository / "sk-broken").mkdir()
+
+        report = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan("promote", SkillManager(self.repository).scan(), skill=None, validate_all=True)
+        )
+
+        self.assertEqual(report.status, "failed")
+        self.assertIn("MISSING_SKILL_MD", [item.code for item in report.diagnostics])
+        self.assertFalse((self.repository / "skills" / "authoring").exists())
+        self.assertFalse((self.repository / ".skill-manager").exists())
+
+    def test_promote_all_promotes_every_valid_skill(self) -> None:
+        for name in ("authoring", "beta"):
+            directory = self.repository / f"sk-{name}"
+            directory.mkdir(exist_ok=True)
+            (directory / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {name}.\n---\n", encoding="utf-8"
+            )
+            (directory / "agents").mkdir(exist_ok=True)
+            (directory / "agents" / "openai.yaml").write_text(
+                f"interface:\n  display_name: {name}\n  short_description: {name}\n", encoding="utf-8"
+            )
+
+        report = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan("promote", SkillManager(self.repository).scan(), skill=None, validate_all=True)
+        )
+
+        self.assertEqual(report.status, "success")
+        self.assertTrue((self.repository / "skills" / "authoring").is_dir())
+        self.assertTrue((self.repository / "skills" / "beta").is_dir())
+
+    def test_promote_all_rolls_back_already_replaced_skill_on_failure(self) -> None:
+        for name in ("authoring", "beta"):
+            directory = self.repository / f"sk-{name}"
+            directory.mkdir(exist_ok=True)
+            (directory / "agents").mkdir(exist_ok=True)
+            (directory / "agents" / "openai.yaml").write_text(
+                f"interface:\n  display_name: {name}\n  short_description: {name}\n", encoding="utf-8"
+            )
+        stable = self.repository / "skills" / "authoring"
+        stable.mkdir()
+        (stable / "old.txt").write_text("old", encoding="utf-8")
+        original_replace = manager_service.os.replace
+        calls = 0
+
+        def failing_second_replace(source, destination):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError("injected")
+            return original_replace(source, destination)
+
+        with patch.object(manager_service.os, "replace", side_effect=failing_second_replace):
+            report = SkillManager(self.repository).apply(
+                SkillManager(self.repository).plan("promote", SkillManager(self.repository).scan(), skill=None, validate_all=True)
+            )
+
+        self.assertEqual(report.status, "failed")
+        self.assertEqual((stable / "old.txt").read_text(), "old")
+
 
 if __name__ == "__main__":
     unittest.main()

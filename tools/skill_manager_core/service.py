@@ -12,6 +12,7 @@ from pathlib import Path
 from .discovery import scan_repository
 from .identity import IdentityError, canonical_skill_name, package_identity, package_manifest
 from .journal import JournalError, append_event, read_events, read_plan, write_plan
+from .locking import ManagerBusyError, exclusive_repository_lock
 from .model import Candidate, CandidateSource, Diagnostic, Plan, Result, Scan
 from .reporting import OperationReport, utc_now
 from .test_runner import run_skill_test
@@ -97,9 +98,19 @@ class SkillManager:
             )
             diagnostics = (*plan.scan.diagnostics, *validation_diagnostics)
         elif plan.command == "promote":
-            results, promotion_diagnostics = _promote_result(
-                plan.scan.candidates, plan.skill, self._repository_root, plan.dry_run
-            )
+            try:
+                if plan.dry_run or plan.validate_all:
+                    results, promotion_diagnostics = _promote_result(
+                        plan.scan.candidates, plan.skill, self._repository_root, plan.dry_run
+                    )
+                else:
+                    with exclusive_repository_lock(self._repository_root):
+                        results, promotion_diagnostics = _promote_result(
+                            plan.scan.candidates, plan.skill, self._repository_root, plan.dry_run
+                        )
+            except ManagerBusyError as exc:
+                results = ()
+                promotion_diagnostics = (Diagnostic("error", "MANAGER_BUSY", str(exc)),)
             diagnostics = (*plan.scan.diagnostics, *promotion_diagnostics)
             if results and results[0].outcome == "promoted":
                 transaction_id = results[0].details.get("transaction_id")
@@ -218,6 +229,22 @@ def _status_results(
 
 
 def _promote_result(candidates: tuple[Candidate, ...], skill_name: str | None, root: Path, dry_run: bool) -> tuple[tuple[Result, ...], tuple[Diagnostic, ...]]:
+    if skill_name is None:
+        selected_batch = sorted(
+            (candidate for candidate in candidates if candidate.source is CandidateSource.DEVELOPMENT),
+            key=lambda candidate: candidate.name,
+        )
+        diagnostics = tuple(
+            diagnostic
+            for candidate in selected_batch
+            for diagnostic in validate_candidate(candidate, root)
+        )
+        if diagnostics:
+            return tuple(
+                Result("development", candidate.name, str(candidate.path), "invalid")
+                for candidate in selected_batch
+            ), diagnostics
+        return _promote_batch(selected_batch, root, dry_run)
     selected = next((candidate for candidate in candidates if candidate.source is CandidateSource.DEVELOPMENT and canonical_skill_name(candidate) == skill_name), None)
     if selected is None:
         return (), (Diagnostic("error", "PROMOTION_SOURCE_MISSING", f"development candidate not found: {skill_name}"),)
@@ -269,6 +296,58 @@ def _promote_result(candidates: tuple[Candidate, ...], skill_name: str | None, r
     state.chmod(0o600)
     shutil.rmtree(transaction)
     return (Result("development", selected.name, str(selected.path), "promoted", {"stable_identity": package_identity(stable), "test_state": "passed", "transaction_id": transaction_id}),), ()
+
+
+def _promote_batch(candidates: list[Candidate], root: Path, dry_run: bool) -> tuple[tuple[Result, ...], tuple[Diagnostic, ...]]:
+    if dry_run:
+        return tuple(Result("development", candidate.name, str(candidate.path), "would-promote", {"test_state": "not-run"}) for candidate in candidates), ()
+    for candidate in candidates:
+        test = run_skill_test(candidate, root)
+        if test.diagnostics:
+            return (Result("development", candidate.name, str(candidate.path), "invalid", test.details),), test.diagnostics
+    transaction_id = str(uuid.uuid4())
+    manager_root = root / ".skill-manager"
+    manager_root.mkdir(mode=0o700, exist_ok=True)
+    transaction = manager_root / "transactions" / transaction_id
+    transaction.mkdir(parents=True, mode=0o700)
+    entries = [{"skill": canonical_skill_name(candidate), "before": ""} for candidate in candidates]
+    plan_hash = write_plan(transaction / "plan.json", {"journal_schema_version": 1, "transaction_id": transaction_id, "skills": entries})
+    events = transaction / "events.jsonl"
+    append_event(events, plan_hash, "PREPARED")
+    staging = transaction / "staging"
+    backup = transaction / "backup"
+    staging.mkdir()
+    backup.mkdir()
+    for candidate in candidates:
+        skill = canonical_skill_name(candidate)
+        assert skill is not None
+        shutil.copytree(candidate.path, staging / skill, symlinks=True)
+    applied: list[str] = []
+    try:
+        append_event(events, plan_hash, "APPLYING")
+        for candidate in candidates:
+            skill = canonical_skill_name(candidate)
+            assert skill is not None
+            stable = root / "skills" / skill
+            if stable.exists():
+                os.replace(stable, backup / skill)
+            os.replace(staging / skill, stable)
+            applied.append(skill)
+        append_event(events, plan_hash, "COMMITTED")
+    except OSError as exc:
+        for skill in reversed(applied):
+            stable = root / "skills" / skill
+            if stable.exists():
+                shutil.rmtree(stable)
+            previous = backup / skill
+            if previous.exists():
+                os.replace(previous, stable)
+        shutil.rmtree(transaction, ignore_errors=True)
+        return (), (Diagnostic("error", "PROMOTION_FAILED", str(exc)),)
+    receipts = {canonical_skill_name(candidate): {"identity": package_identity(root / "skills" / str(canonical_skill_name(candidate))), "transaction_id": transaction_id} for candidate in candidates}
+    (manager_root / "state.json").write_text(json.dumps({"schema_version": 1, "receipts": receipts}, sort_keys=True), encoding="utf-8")
+    shutil.rmtree(transaction)
+    return tuple(Result("development", candidate.name, str(candidate.path), "promoted", {"transaction_id": transaction_id, "test_state": "passed"}) for candidate in candidates), ()
 
 
 def _fsync_directory(path: Path) -> None:
