@@ -111,6 +111,8 @@ def _stable_candidates(skills_root: Path) -> tuple[list[Candidate], list[Diagnos
     candidates: list[Candidate] = []
     diagnostics: list[Diagnostic] = []
     for entry in entries:
+        if entry.name == "__pycache__":
+            continue
         try:
             candidates.append(_candidate(CandidateSource.STABLE, entry))
         except OSError as exc:
