@@ -14,6 +14,7 @@ from tools import skill_manager
 from tools.skill_manager_core import CandidateSource, SkillManager
 from tools.skill_manager_core import service as manager_service
 from tools.skill_manager_core.journal import append_event, write_plan
+from tools.skill_manager_core.targets import AgentTarget, is_exact_managed_link
 
 
 class SkillManagerCoreTests(unittest.TestCase):
@@ -58,6 +59,34 @@ class SkillManagerCoreTests(unittest.TestCase):
             [(result.source, result.skill) for result in report.results],
             [("development", "sk-authoring"), ("stable", "released")],
         )
+
+    def test_target_requires_real_config_root_and_exact_absolute_link(self) -> None:
+        target = AgentTarget("codex", self.repository / ".codex")
+        stable = self.repository / "skills" / "authoring"
+        stable.mkdir(exist_ok=True)
+        self.assertFalse(target.detected())
+        target.config_root.mkdir()
+        target.skills_root.mkdir()
+        destination = target.skills_root / "authoring"
+        destination.symlink_to(stable)
+
+        self.assertTrue(target.detected())
+        self.assertTrue(is_exact_managed_link(destination, stable))
+
+    def test_target_install_and_uninstall_preserve_conflicts(self) -> None:
+        target = AgentTarget("codex", self.repository / ".codex")
+        target.config_root.mkdir()
+        stable = self.repository / "skills" / "authoring"
+        stable.mkdir(exist_ok=True)
+
+        self.assertEqual(target.install(stable), "installed")
+        self.assertEqual(target.install(stable), "no-change")
+        self.assertEqual(target.uninstall(stable), "uninstalled")
+        target.skills_root.mkdir(exist_ok=True)
+        conflict = target.skills_root / "authoring"
+        conflict.mkdir()
+        self.assertEqual(target.install(stable), "conflict")
+        self.assertTrue(conflict.is_dir())
 
     def test_list_json_uses_the_common_versioned_report_envelope(self) -> None:
         stdout = io.StringIO()
