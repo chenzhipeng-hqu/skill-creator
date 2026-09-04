@@ -14,7 +14,7 @@ from tools import skill_manager
 from tools.skill_manager_core import CandidateSource, SkillManager
 from tools.skill_manager_core import service as manager_service
 from tools.skill_manager_core.journal import append_event, write_plan
-from tools.skill_manager_core.targets import AgentTarget, is_exact_managed_link
+from tools.skill_manager_core.targets import AgentTarget, hermes_target, is_exact_managed_link, opencode_discovery_roots
 
 
 class SkillManagerCoreTests(unittest.TestCase):
@@ -87,6 +87,16 @@ class SkillManagerCoreTests(unittest.TestCase):
         conflict.mkdir()
         self.assertEqual(target.install(stable), "conflict")
         self.assertTrue(conflict.is_dir())
+
+    def test_hermes_and_opencode_targets_use_explicit_local_roots(self) -> None:
+        home = self.repository / "home"
+        active_hermes = self.repository / "active-hermes"
+
+        self.assertEqual(hermes_target(home, active_hermes).config_root, active_hermes)
+        self.assertEqual(
+            opencode_discovery_roots(home),
+            (home / ".config" / "opencode" / "skills", home / ".agents" / "skills", home / ".claude" / "skills"),
+        )
 
     def test_list_json_uses_the_common_versioned_report_envelope(self) -> None:
         stdout = io.StringIO()

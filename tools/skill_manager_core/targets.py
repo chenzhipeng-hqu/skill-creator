@@ -54,6 +54,25 @@ def base_targets(home: Path) -> dict[str, AgentTarget]:
     }
 
 
+def hermes_target(home: Path, active_home: Path | None = None) -> AgentTarget:
+    """Resolve only the active Hermes home, never a Hub registry."""
+
+    return AgentTarget("hermes", active_home or home / ".hermes")
+
+
+def opencode_target(home: Path, config_home: Path | None = None) -> AgentTarget:
+    """Resolve the native OpenCode configuration root."""
+
+    return AgentTarget("opencode", (config_home or home / ".config") / "opencode")
+
+
+def opencode_discovery_roots(home: Path, config_home: Path | None = None) -> tuple[Path, ...]:
+    """Return native plus compatibility roots used for duplicate-exposure preflight."""
+
+    native = opencode_target(home, config_home).skills_root
+    return native, home / ".agents" / "skills", home / ".claude" / "skills"
+
+
 def is_exact_managed_link(destination: Path, stable: Path) -> bool:
     """Return true only for a direct absolute link to this Stable Skill."""
 
