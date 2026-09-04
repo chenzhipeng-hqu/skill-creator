@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import subprocess
+import stat
 import sys
 import tempfile
 import unittest
@@ -840,6 +841,86 @@ class SkillManagerCoreTests(unittest.TestCase):
 
         self.assertEqual(report.status, "failed")
         self.assertIn("INVALID_OPENAI_METADATA", [diagnostic.code for diagnostic in report.diagnostics])
+
+    def test_validate_runs_skill_test_entrypoint_and_records_private_logs(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n",
+            encoding="utf-8",
+        )
+        script = development / "scripts" / "tool"
+        script.parent.mkdir()
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o755)
+        entrypoint = self.repository / "tests" / "authoring" / "run"
+        entrypoint.parent.mkdir(parents=True)
+        entrypoint.write_text("#!/bin/sh\nprintf '%s' \"$SKILL_SOURCE_KIND:$SKILL_NAME\"\n", encoding="utf-8")
+        entrypoint.chmod(0o755)
+
+        report = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan(
+                "validate", SkillManager(self.repository).scan(), skill="authoring"
+            )
+        )
+
+        self.assertEqual(report.status, "success")
+        result = report.results[0]
+        self.assertEqual(result.details["test_state"], "passed")
+        self.assertIn("development:authoring", result.details["stdout_tail"])
+        self.assertTrue(Path(result.details["stdout_path"]).is_file())
+        self.assertEqual(stat.S_IMODE(Path(result.details["stdout_path"]).stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(Path(result.details["stdout_path"]).parent.stat().st_mode), 0o700)
+
+    def test_validate_rejects_nonzero_test_entrypoint_and_managed_mutation(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n", encoding="utf-8"
+        )
+        script = development / "scripts" / "tool"
+        script.parent.mkdir()
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o755)
+        entrypoint = self.repository / "tests" / "authoring" / "run"
+        entrypoint.parent.mkdir(parents=True)
+        entrypoint.write_text("#!/bin/sh\nprintf changed > \"$SKILL_UNDER_TEST/changed.txt\"\nexit 4\n", encoding="utf-8")
+        entrypoint.chmod(0o755)
+
+        failed = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan("validate", SkillManager(self.repository).scan(), skill="authoring")
+        )
+        (development / "changed.txt").unlink()
+        entrypoint.write_text("#!/bin/sh\nprintf changed > \"$SKILL_UNDER_TEST/changed.txt\"\n", encoding="utf-8")
+        mutated = SkillManager(self.repository).apply(
+            SkillManager(self.repository).plan("validate", SkillManager(self.repository).scan(), skill="authoring")
+        )
+
+        self.assertIn("SKILL_TEST_FAILED", [item.code for item in failed.diagnostics])
+        self.assertIn("SKILL_TEST_MUTATED_CONTENT", [item.code for item in failed.diagnostics])
+        self.assertIn("SKILL_TEST_MUTATED_CONTENT", [item.code for item in mutated.diagnostics])
+
+    def test_validate_times_out_test_process_group(self) -> None:
+        development = self.repository / "sk-authoring"
+        (development / "agents").mkdir()
+        (development / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Authoring\n  short_description: Development\n", encoding="utf-8"
+        )
+        script = development / "scripts" / "tool"
+        script.parent.mkdir()
+        script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        script.chmod(0o755)
+        entrypoint = self.repository / "tests" / "authoring" / "run"
+        entrypoint.parent.mkdir(parents=True)
+        entrypoint.write_text("#!/bin/sh\nsleep 1\n", encoding="utf-8")
+        entrypoint.chmod(0o755)
+
+        with patch("tools.skill_manager_core.test_runner.TEST_TIMEOUT_SECONDS", 0.01):
+            report = SkillManager(self.repository).apply(
+                SkillManager(self.repository).plan("validate", SkillManager(self.repository).scan(), skill="authoring")
+            )
+
+        self.assertIn("SKILL_TEST_TIMEOUT", [item.code for item in report.diagnostics])
 
 
 if __name__ == "__main__":

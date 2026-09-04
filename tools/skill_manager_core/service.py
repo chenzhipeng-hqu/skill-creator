@@ -9,6 +9,7 @@ from .discovery import scan_repository
 from .identity import IdentityError, canonical_skill_name, package_identity, package_manifest
 from .model import Candidate, CandidateSource, Diagnostic, Plan, Result, Scan
 from .reporting import OperationReport, utc_now
+from .test_runner import run_skill_test
 from .validation import validate_candidate
 
 
@@ -224,14 +225,22 @@ def _validate_results(
     for candidate in selected:
         candidate_diagnostics = validate_candidate(candidate, repository_root)
         diagnostics.extend(candidate_diagnostics)
+        test_details: dict[str, str] = {"test_state": "not-run"}
+        test_diagnostics: tuple[Diagnostic, ...] = ()
+        if not candidate_diagnostics:
+            test_result = run_skill_test(candidate, repository_root)
+            test_details = test_result.details
+            test_diagnostics = test_result.diagnostics
+            diagnostics.extend(test_diagnostics)
         results.append(
             Result(
                 source=candidate.source.value,
                 skill=candidate.name,
                 path=str(candidate.path),
-                outcome="valid" if not candidate_diagnostics else "invalid",
+                outcome="valid" if not candidate_diagnostics and not test_diagnostics else "invalid",
                 details={
-                    "validation_state": "valid" if not candidate_diagnostics else "invalid"
+                    "validation_state": "valid" if not candidate_diagnostics else "invalid",
+                    **test_details,
                 },
             )
         )
