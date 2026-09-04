@@ -19,6 +19,7 @@ from tools.skill_manager_core.targets import AgentTarget, hermes_target, is_exac
 from tools.skill_manager_core.provenance import stable_provenance
 from tools.skill_manager_core.identity import package_identity
 from tools.skill_manager_core.release import release_tag_name
+from tools.skill_manager_core.tui import TuiState, advance
 
 
 class SkillManagerCoreTests(unittest.TestCase):
@@ -124,6 +125,14 @@ class SkillManagerCoreTests(unittest.TestCase):
             release_tag_name("authoring", instant, {"authoring-260904-v1", "authoring-260904-v3"}),
             "authoring-260904-v4",
         )
+
+    def test_tui_requires_literal_confirmation_and_cancellation_never_applies(self) -> None:
+        state = advance(advance(TuiState(), "\n"), "\n")
+        self.assertEqual(state.screen, 3)
+        self.assertFalse(advance(state, "\n").applied)
+        self.assertFalse(advance(state, "y", has_errors=True).applied)
+        self.assertTrue(advance(state, "y").applied)
+        self.assertTrue(advance(state, "q").cancelled)
 
     def test_list_json_uses_the_common_versioned_report_envelope(self) -> None:
         stdout = io.StringIO()
