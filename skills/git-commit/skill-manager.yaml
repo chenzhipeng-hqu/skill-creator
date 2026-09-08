@@ -1,0 +1,12 @@
+schema_version: 1
+
+hooks:
+  - id: commit-gate
+    event: PreToolUse
+    script: scripts/commit-gate.sh
+    activation: optional
+    targets:
+      codex:
+        matcher: Bash
+      claude:
+        matcher: Bash

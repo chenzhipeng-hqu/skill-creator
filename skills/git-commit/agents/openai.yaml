@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Commit"
+  short_description: "Create narrowly scoped commits with the required format."
+  default_prompt: "Use $git-commit to inspect changes, draft the required message, and create a narrowly scoped commit."
