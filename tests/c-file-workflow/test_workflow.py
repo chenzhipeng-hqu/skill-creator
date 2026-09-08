@@ -11,7 +11,9 @@ import sys
 import tempfile
 import time
 import unittest
+import importlib.util
 from pathlib import Path
+from unittest.mock import patch
 
 
 SKILL = Path(
@@ -23,6 +25,11 @@ SKILL = Path(
 SCRIPT = SKILL / "scripts" / "c_file_workflow.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 CLANG_FORMAT = shutil.which("clang-format")
+MODULE_SPEC = importlib.util.spec_from_file_location("c_file_workflow_under_test", SCRIPT)
+assert MODULE_SPEC is not None and MODULE_SPEC.loader is not None
+WORKFLOW = importlib.util.module_from_spec(MODULE_SPEC)
+sys.modules[MODULE_SPEC.name] = WORKFLOW
+MODULE_SPEC.loader.exec_module(WORKFLOW)
 
 
 def invoke(*arguments: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -80,6 +87,24 @@ class WorkflowTests(unittest.TestCase):
         both = invoke("--check", "--component", str(source), str(header))
         self.assert_success(both)
         self.assertNotIn("duplicate input", both.stderr)
+
+    def test_all_generated_templates_compile_as_strict_c11(self) -> None:
+        self.assert_success(invoke("--plain", "board_cfg", "--output", str(self.root)))
+        self.assert_success(invoke("--new", "worker.c", "--output", str(self.root)))
+        self.assert_success(invoke("--new", "worker.h", "--output", str(self.root)))
+        commands = (
+            (self.root / "board_cfg.c", self.root / "board_cfg.o", ("-I", str(self.root))),
+            (self.root / "worker.c", self.root / "worker.o", ()),
+            (self.root / "worker.h", self.root / "worker_h.o", ("-x", "c")),
+        )
+        for source, output, extra in commands:
+            compiled = subprocess.run(
+                ["gcc", "-std=c11", "-Wall", "-Wextra", "-Werror", *extra, "-c", str(source), "-o", str(output)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
 
     def test_component_handler_order_is_checked(self) -> None:
         self.assert_success(invoke("uart", "--output", str(self.root)))
@@ -156,6 +181,50 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(good.read_bytes(), before)
 
+    def test_batch_replace_rolls_back_after_later_replace_failure(self) -> None:
+        first = self.root / "first.c"
+        second = self.root / "second.c"
+        first.write_bytes(b"first before\n")
+        second.write_bytes(b"second before\n")
+        original_replace = WORKFLOW.os.replace
+        calls = 0
+
+        def fail_second_replace(source: object, destination: object) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected replace failure")
+            original_replace(source, destination)
+
+        with patch.object(WORKFLOW.os, "replace", side_effect=fail_second_replace):
+            with self.assertRaisesRegex(WORKFLOW.WorkflowError, "atomic file replacement failed"):
+                WORKFLOW._atomic_batch_replace(
+                    [(first, b"first after\n", 0o644), (second, b"second after\n", 0o644)]
+                )
+        self.assertEqual(first.read_bytes(), b"first before\n")
+        self.assertEqual(second.read_bytes(), b"second before\n")
+
+    def test_batch_replace_reports_rollback_failure(self) -> None:
+        first = self.root / "first.c"
+        second = self.root / "second.c"
+        first.write_bytes(b"first before\n")
+        second.write_bytes(b"second before\n")
+        original_replace = WORKFLOW.os.replace
+        calls = 0
+
+        def fail_replace_and_restore(source: object, destination: object) -> None:
+            nonlocal calls
+            calls += 1
+            if calls in {2, 3}:
+                raise OSError("injected replacement or rollback failure")
+            original_replace(source, destination)
+
+        with patch.object(WORKFLOW.os, "replace", side_effect=fail_replace_and_restore):
+            with self.assertRaisesRegex(WORKFLOW.WorkflowError, "rollback failed"):
+                WORKFLOW._atomic_batch_replace(
+                    [(first, b"first after\n", 0o644), (second, b"second after\n", 0o644)]
+                )
+
     def test_bom_and_crlf_are_preserved(self) -> None:
         source = self.root / "bom.c"
         source.write_bytes(b"\xef\xbb\xbfint  value(void){return 0;}\r\n")
@@ -205,6 +274,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("int  value", (hidden / "file.c").read_text())
         self.assertIn("int  value", (vendor / "file.c").read_text())
         self.assertIn("int  value", (excluded / "file.c").read_text())
+
+    def test_recursive_symbolic_link_directory_is_rejected(self) -> None:
+        real = self.root / "real"
+        real.mkdir()
+        source = real / "file.c"
+        source.write_text("int  value(void){return 0;}\n")
+        linked = self.root / "linked"
+        linked.symlink_to(real, target_is_directory=True)
+
+        result = invoke("--check", "--recursive", str(linked))
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("symbolic-link directory", result.stderr)
+        self.assertEqual(source.read_text(), "int  value(void){return 0;}\n")
 
     def test_existing_relative_directory_is_not_treated_as_creation(self) -> None:
         source_dir = self.root / "src"
