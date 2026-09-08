@@ -242,6 +242,58 @@ class SkillManagerCoreTests(unittest.TestCase):
         self.assertEqual(payload["results"][0]["details"]["config_root"], str(home / ".codex"))
         self.assertTrue((home / ".codex" / "skills" / "released").is_symlink())
 
+    def test_hook_cli_manages_only_the_installed_git_commit_gate(self) -> None:
+        stable = self.repository / "skills" / "git-commit"
+        (stable / "agents").mkdir(parents=True)
+        (stable / "scripts").mkdir()
+        (stable / "skill-manager.yaml").write_text(
+            "schema_version: 1\nhooks:\n  - id: commit-gate\n    event: PreToolUse\n    script: scripts/commit-gate.sh\n    activation: optional\n    targets:\n      codex:\n        matcher: Bash\n",
+            encoding="utf-8",
+        )
+        (stable / "SKILL.md").write_text(
+            "---\nname: git-commit\ndescription: Commit helper.\n---\n", encoding="utf-8"
+        )
+        (stable / "agents" / "openai.yaml").write_text(
+            "interface:\n  display_name: Git Commit\n  short_description: Commit helper\n", encoding="utf-8"
+        )
+        script = stable / "scripts" / "commit-gate.sh"
+        script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        script.chmod(0o755)
+        test_entrypoint = self.repository / "tests" / "git-commit" / "run"
+        test_entrypoint.parent.mkdir(parents=True)
+        test_entrypoint.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        test_entrypoint.chmod(0o755)
+        home = self.repository / "home"
+        (home / ".codex").mkdir(parents=True)
+        manager = SkillManager(self.repository, home=home)
+        skill_install = manager.apply(
+            manager.plan("install", manager.scan(), skills=("git-commit",), agents=("codex",))
+        )
+        self.assertEqual(skill_install.status, "success")
+        self.assertEqual(skill_install.results[0].details["hook_integrations"], ["commit-gate"])
+
+        installed = manager.apply(manager.plan("hook-install", manager.scan(), skill="git-commit", agents=("codex",)))
+        status = manager.apply(manager.plan("hook-status", manager.scan(), skill="git-commit", agents=("codex",)))
+        removed = manager.apply(manager.plan("hook-uninstall", manager.scan(), skill="git-commit", agents=("codex",)))
+
+        self.assertFalse(installed.diagnostics, installed.diagnostics)
+        self.assertEqual(installed.results[0].outcome, "installed")
+        self.assertEqual(status.results[0].outcome, "installed")
+        self.assertEqual(removed.results[0].outcome, "uninstalled")
+        hooks = json.loads((home / ".codex" / "hooks.json").read_text(encoding="utf-8"))
+        self.assertEqual(hooks["hooks"]["PreToolUse"], [])
+        self.assertFalse((home / ".codex" / ".skill-manager" / "hook-receipts" / "git-commit.json").exists())
+
+        combined_home = self.repository / "combined-home"
+        (combined_home / ".codex").mkdir(parents=True)
+        combined = SkillManager(self.repository, home=combined_home).apply(
+            SkillManager(self.repository, home=combined_home).plan(
+                "install", SkillManager(self.repository, home=combined_home).scan(),
+                skills=("git-commit",), agents=("codex",), with_hooks=True,
+            )
+        )
+        self.assertEqual([result.outcome for result in combined.results], ["installed", "installed"])
+
     def test_install_rejects_invalid_stable_but_exact_uninstall_remains_allowed(self) -> None:
         home = self.repository / "home"
         (home / ".codex").mkdir(parents=True)

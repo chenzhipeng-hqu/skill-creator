@@ -69,6 +69,70 @@ def tag_is_available(tag: str, existing_tags: set[str]) -> bool:
     return tag not in existing_tags
 
 
+def release_path_has_changes(repository_root: Path, stable_path: Path) -> bool:
+    """Return whether a scoped release commit would contain a path change."""
+
+    relative_path = stable_path.relative_to(repository_root)
+    status = _run_git(
+        ["status", "--porcelain=v1", "--untracked-files=all", "--", str(relative_path)],
+        repository_root,
+        check=True,
+        text=True,
+    )
+    return bool(status.stdout.strip())
+
+
+def release_for_receipt(
+    repository_root: Path,
+    skill: str,
+    identity: str,
+    promotion_transaction: str,
+) -> tuple[str, str] | None:
+    """Find an immutable release tag already bound to one Promotion Receipt."""
+
+    tags = _run_git(
+        ["tag", "--list", f"{skill}-*", "--sort=-version:refname"],
+        repository_root,
+        check=True,
+        text=True,
+    ).stdout.splitlines()
+    for tag in tags:
+        annotation = _run_git(
+            ["for-each-ref", f"refs/tags/{tag}", "--format=%(contents)"],
+            repository_root,
+            check=True,
+            text=True,
+        ).stdout
+        if f"Package-Identity: {identity}" not in annotation:
+            continue
+        if (
+            f"Atomic-Batch: {promotion_transaction}" not in annotation
+            and f"Promotion-Transaction: {promotion_transaction}" not in annotation
+        ):
+            continue
+        commit = _run_git(
+            ["rev-list", "-n", "1", tag],
+            repository_root,
+            check=True,
+            text=True,
+        ).stdout.strip()
+        relative_path = f"skills/{skill}"
+        tagged_diff = _run_git(
+            ["diff", "--quiet", tag, "--", relative_path],
+            repository_root,
+        )
+        untracked = _run_git(
+            ["ls-files", "--others", "--exclude-standard", "--", relative_path],
+            repository_root,
+            check=True,
+            text=True,
+        ).stdout
+        if tagged_diff.returncode != 0 or untracked.strip():
+            continue
+        return tag, commit
+    return None
+
+
 def read_commit_message(path: Path) -> str:
     """Validate a caller-approved release commit message file."""
 
@@ -190,6 +254,19 @@ def rollback_git_release(
     current = git_output(repository_root, "rev-parse", f"refs/heads/{branch}")
     if current not in {head, *release_commits}:
         raise OSError(f"branch changed outside transaction: {branch}")
+    if current == head:
+        staged_release = _run_git(
+            ["diff", "--cached", "--quiet", "--", "skills"],
+            repository_root,
+        )
+        if staged_release.returncode == 0:
+            return
+        _run_git(
+            ["reset", "--mixed", head, "--", "skills"],
+            repository_root,
+            check=True,
+        )
+        return
     _run_git(
         ["update-ref", f"refs/heads/{branch}", head, current],
         repository_root,

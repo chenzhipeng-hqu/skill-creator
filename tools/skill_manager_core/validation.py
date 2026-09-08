@@ -67,6 +67,7 @@ def validate_candidate(
     if isinstance(metadata, dict):
         _validate_optional_metadata(metadata, candidate.path, diagnostics)
     diagnostics.extend(_validate_managed_files(candidate.path))
+    diagnostics.extend(_validate_skill_manager_manifest(candidate.path))
     try:
         package_manifest(candidate.path)
     except (IdentityError, OSError) as exc:
@@ -84,6 +85,38 @@ def validate_candidate(
             )
     diagnostics.extend(_validate_markdown_references(candidate.path))
     return tuple(diagnostics)
+
+
+def _validate_skill_manager_manifest(skill_root: Path) -> list[Diagnostic]:
+    path = skill_root / "skill-manager.yaml"
+    if not path.exists():
+        return []
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        return [_error("HOOK_MANIFEST_INVALID", f"cannot parse skill-manager.yaml: {exc}")]
+    hooks = document.get("hooks") if isinstance(document, dict) else None
+    if not isinstance(document, dict) or document.get("schema_version") != 1 or not isinstance(hooks, list):
+        return [_error("HOOK_MANIFEST_INVALID", "skill-manager.yaml requires schema_version: 1 and hooks list")]
+    diagnostics: list[Diagnostic] = []
+    ids: set[str] = set()
+    for hook in hooks:
+        if not isinstance(hook, dict):
+            diagnostics.append(_error("HOOK_MANIFEST_INVALID", "hook entry must be mapping"))
+            continue
+        identifier, script, targets = hook.get("id"), hook.get("script"), hook.get("targets")
+        if not isinstance(identifier, str) or not identifier or identifier in ids:
+            diagnostics.append(_error("HOOK_MANIFEST_INVALID", "hook id must be unique non-empty string"))
+        else:
+            ids.add(identifier)
+        script_path = _lexically_contained_path(skill_root, skill_root, script) if isinstance(script, str) else None
+        if script_path is None or not _is_contained_regular_file(skill_root, script_path) or not bool(script_path.lstat().st_mode & 0o111):
+            diagnostics.append(_error("HOOK_MANIFEST_INVALID", "hook script must be executable regular file inside Skill"))
+        if hook.get("event") != "PreToolUse" or hook.get("activation") != "optional" or not isinstance(targets, dict) or not targets:
+            diagnostics.append(_error("HOOK_MANIFEST_INVALID", "hook requires PreToolUse, optional activation, and targets"))
+        elif any(agent not in {"codex", "claude"} or not isinstance(value, dict) or not isinstance(value.get("matcher"), str) for agent, value in targets.items()):
+            diagnostics.append(_error("HOOK_MANIFEST_INVALID", "hook targets must be supported Agent matcher mappings"))
+    return diagnostics
 
 
 def _validate_markdown_references(skill_root: Path) -> list[Diagnostic]:

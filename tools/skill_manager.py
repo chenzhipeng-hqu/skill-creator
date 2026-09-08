@@ -59,14 +59,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     promote_parser.add_argument("--dry-run", action="store_true")
     promote_parser.add_argument("--json", action="store_true")
-    recover_parser = subcommands.add_parser("recover", help="recover an unfinished promotion")
+    record_release_parser = subcommands.add_parser(
+        "record-release",
+        help="backfill a Git release for an existing Promotion Receipt",
+    )
+    record_release_parser.add_argument("skill", nargs="*", metavar="SKILL")
+    record_release_parser.add_argument("--all", action="store_true", dest="record_release_all")
+    record_release_parser.add_argument(
+        "--commit-message-file",
+        action="append",
+        required=True,
+        metavar="SKILL=PATH",
+    )
+    record_release_parser.add_argument("--dry-run", action="store_true")
+    record_release_parser.add_argument("--json", action="store_true")
+    recover_parser = subcommands.add_parser("recover", help="recover an unfinished transaction")
     recover_parser.add_argument("--dry-run", action="store_true")
     recover_parser.add_argument("--json", action="store_true")
+    hook_parser = subcommands.add_parser("hook", help="manage explicit Stable Skill hook integrations")
+    hook_actions = hook_parser.add_subparsers(dest="hook_action", required=True)
+    for action in ("install", "status", "uninstall"):
+        action_parser = hook_actions.add_parser(action)
+        action_parser.add_argument("skill", metavar="SKILL")
+        action_parser.add_argument("--agent", action="append", required=True, choices=("codex", "claude", "agents", "hermes", "opencode"))
+        action_parser.add_argument("--dry-run", action="store_true")
+        action_parser.add_argument("--json", action="store_true")
     for command, help_text in (("install", "install Stable Skills"), ("uninstall", "uninstall managed Stable Skill links")):
         operation_parser = subcommands.add_parser(command, help=help_text)
         operation_parser.add_argument("skill", nargs="*", metavar="SKILL")
         operation_parser.add_argument("--all", action="store_true", dest="install_all")
         operation_parser.add_argument("--agent", action="append", required=True, choices=("codex", "claude", "agents", "hermes", "opencode"))
+        if command == "install":
+            operation_parser.add_argument("--with-hooks", action="store_true")
         operation_parser.add_argument("--dry-run", action="store_true")
         operation_parser.add_argument("--json", action="store_true")
     return parser
@@ -156,6 +180,10 @@ def main(
         bool(arguments.skill) == bool(arguments.promote_all)
     ):
         parser.error("select SKILL... or --all, but not both")
+    if arguments.command == "record-release" and (
+        bool(arguments.skill) == bool(arguments.record_release_all)
+    ):
+        parser.error("select SKILL... or --all, but not both")
     if arguments.command == "validate" and (
         bool(arguments.skill) == bool(arguments.validate_all)
     ):
@@ -163,6 +191,8 @@ def main(
     if arguments.command == "promote" and bool(arguments.commit_message_file) != bool(arguments.record_release):
         parser.error("--commit-message-file requires --record-release and vice versa")
     raw_skill = getattr(arguments, "skill", None)
+    if arguments.command == "hook":
+        arguments.command = f"hook-{arguments.hook_action}"
     scalar_skill = raw_skill if isinstance(raw_skill, str) else None
     selected_skills = tuple(raw_skill) if isinstance(raw_skill, list) else ()
     with _termination_as_operation_error():
@@ -180,10 +210,12 @@ def main(
                 select_all=(
                     getattr(arguments, "install_all", False)
                     or getattr(arguments, "promote_all", False)
+                    or getattr(arguments, "record_release_all", False)
                 ),
                 replace_stable_drift=getattr(arguments, "replace_stable_drift", False),
                 record_release=getattr(arguments, "record_release", False),
                 commit_message_files=tuple(getattr(arguments, "commit_message_file", ())),
+                with_hooks=getattr(arguments, "with_hooks", False),
             )
         )
 

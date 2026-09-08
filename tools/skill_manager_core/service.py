@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from .discovery import scan_repository
 from .filesystem import mutation_filesystem_error
 from .identity import IdentityError, canonical_skill_name, package_identity, package_manifest
+from .hooks import discover_hook_integrations, manage_commit_gate
 from .journal import JournalError, append_event, read_events, read_plan, write_plan
 from .locking import (
     ManagerBusyError,
@@ -33,6 +34,8 @@ from .release import (
     is_scoped_release_commit,
     read_commit_message,
     record_skill_release,
+    release_for_receipt,
+    release_path_has_changes,
     release_tag_name,
     rollback_git_release,
 )
@@ -107,10 +110,11 @@ class SkillManager:
         replace_stable_drift: bool = False,
         record_release: bool = False,
         commit_message_files: tuple[str, ...] = (),
+        with_hooks: bool = False,
     ) -> Plan:
         """Prepare one typed command from a Scan."""
 
-        if command not in {"list", "status", "diff", "validate", "promote", "recover", "install", "uninstall"}:
+        if command not in {"list", "status", "diff", "validate", "promote", "record-release", "recover", "install", "uninstall", "hook-install", "hook-status", "hook-uninstall"}:
             raise ValueError(f"unsupported command: {command}")
         return Plan(
             command=command,
@@ -126,17 +130,18 @@ class SkillManager:
             replace_stable_drift=replace_stable_drift,
             record_release=record_release,
             commit_message_files=commit_message_files,
+            with_hooks=with_hooks,
         )
 
     def apply(self, plan: Plan) -> OperationReport:
         """Apply one Plan while respecting read-only and dry-run locks."""
 
-        inspection = plan.dry_run or plan.command in {"list", "status", "diff", "validate"}
+        inspection = plan.dry_run or plan.command in {"list", "status", "diff", "validate", "hook-status"}
         if not inspection:
             return self._apply_unlocked(plan)
         targets = _resolved_targets(self._home, self._environ)
         lock_paths = [self._repository_root / ".skill-manager" / "repository.lock"]
-        if plan.command in {"status", "install", "uninstall"}:
+        if plan.command in {"status", "install", "uninstall", "hook-install", "hook-status", "hook-uninstall"}:
             selected = plan.agents or tuple(
                 key for key, target in targets.items() if target.detected()
             )
@@ -278,9 +283,74 @@ class SkillManager:
                 recorded_transaction = promoted_result.details.get("transaction_id")
                 transaction_id = str(recorded_transaction) if recorded_transaction else None
                 changed = True
-        elif plan.command in {"install", "uninstall"}:
+        elif plan.command == "record-release":
             try:
                 if plan.dry_run:
+                    results, release_diagnostics = _record_release_result(
+                        plan.scan.candidates,
+                        plan.skills or ((plan.skill,) if plan.skill else ()),
+                        plan.select_all,
+                        self._repository_root,
+                        True,
+                        plan.commit_message_files,
+                    )
+                else:
+                    _, initial_diagnostics = _record_release_result(
+                        plan.scan.candidates,
+                        plan.skills or ((plan.skill,) if plan.skill else ()),
+                        plan.select_all,
+                        self._repository_root,
+                        True,
+                        plan.commit_message_files,
+                    )
+                    if initial_diagnostics:
+                        results = ()
+                        release_diagnostics = initial_diagnostics
+                    else:
+                        with exclusive_repository_lock(self._repository_root):
+                            with exclusive_target_locks(
+                                _recovery_target_roots(self._repository_root)
+                            ):
+                                _, recovery_diagnostics = _recover_result(
+                                    self._repository_root, False
+                                )
+                                if recovery_diagnostics:
+                                    results = ()
+                                    release_diagnostics = recovery_diagnostics
+                                else:
+                                    fresh_scan = self.scan()
+                                    results, release_diagnostics = _record_release_result(
+                                        fresh_scan.candidates,
+                                        plan.skills or ((plan.skill,) if plan.skill else ()),
+                                        plan.select_all,
+                                        self._repository_root,
+                                        False,
+                                        plan.commit_message_files,
+                                    )
+            except ManagerBusyError as exc:
+                results = ()
+                release_diagnostics = (
+                    Diagnostic("error", "MANAGER_BUSY", str(exc)),
+                )
+            diagnostics = (*plan.scan.diagnostics, *release_diagnostics)
+            recorded = next(
+                (result for result in results if result.outcome == "release-recorded"),
+                None,
+            )
+            if recorded is not None:
+                recorded_transaction = recorded.details.get("transaction_id")
+                transaction_id = (
+                    str(recorded_transaction) if recorded_transaction else None
+                )
+                changed = True
+        elif plan.command in {"install", "uninstall"}:
+            try:
+                if plan.command == "install" and plan.with_hooks:
+                    results, installation_diagnostics, transaction_id = _installation_with_hooks(
+                        plan.scan.candidates, plan.skills, plan.agents, plan.dry_run,
+                        self._home, self._repository_root, self._environ,
+                    )
+                elif plan.dry_run:
                     results, installation_diagnostics, transaction_id = _installation_results(
                         plan.scan.candidates,
                         plan.skills,
@@ -341,6 +411,48 @@ class SkillManager:
                 installation_diagnostics = (Diagnostic("error", "MANAGER_BUSY", str(exc)),)
             diagnostics = (*plan.scan.diagnostics, *installation_diagnostics)
             changed = any(result.outcome in {"installed", "uninstalled"} for result in results)
+        elif plan.command in {"hook-install", "hook-status", "hook-uninstall"}:
+            stable = next(
+                (
+                    candidate
+                    for candidate in plan.scan.candidates
+                    if candidate.source is CandidateSource.STABLE
+                    and canonical_skill_name(candidate) == plan.skill
+                ),
+                None,
+            )
+            if stable is None:
+                results = ()
+                hook_diagnostics = (Diagnostic("error", "STABLE_SKILL_NOT_FOUND", f"stable Skill not found: {plan.skill}"),)
+            elif len(plan.agents) != 1:
+                results = ()
+                hook_diagnostics = (Diagnostic("error", "HOOK_EXACTLY_ONE_TARGET", "select exactly one Agent Target for a hook operation"),)
+            else:
+                target = _resolved_targets(self._home, self._environ)[plan.agents[0]]
+                validation = tuple(validate_candidate(stable, self._repository_root))
+                if validation:
+                    results = ()
+                    hook_diagnostics = validation
+                elif not target.detected():
+                    results = ()
+                    hook_diagnostics = (Diagnostic("error", "TARGET_NOT_DETECTED", f"target not detected: {target.key}"),)
+                else:
+                    action = plan.command.removeprefix("hook-")
+                    try:
+                        if action == "status" or plan.dry_run:
+                            result, hook_diagnostics = manage_commit_gate(action, plan.skill or "", target, stable.path, plan.dry_run)
+                        else:
+                            with exclusive_repository_lock(self._repository_root):
+                                with exclusive_target_locks((target.config_root,)):
+                                    fresh_scan = self.scan()
+                                    fresh_stable = next(candidate for candidate in fresh_scan.candidates if candidate.source is CandidateSource.STABLE and canonical_skill_name(candidate) == plan.skill)
+                                    result, hook_diagnostics = manage_commit_gate(action, plan.skill or "", target, fresh_stable.path, False)
+                        results = (result,)
+                    except (ManagerBusyError, OSError) as exc:
+                        results = ()
+                        hook_diagnostics = (Diagnostic("error", "HOOK_APPLY_FAILED", str(exc)),)
+            diagnostics = (*plan.scan.diagnostics, *hook_diagnostics)
+            changed = any(result.outcome in {"installed", "uninstalled"} for result in results)
         else:
             try:
                 if plan.dry_run:
@@ -384,7 +496,7 @@ class SkillManager:
             report_status = "recovery-required"
         elif error_codes:
             report_status = "failed"
-        elif plan.command in {"promote", "install", "uninstall"} and not plan.dry_run and not changed:
+        elif plan.command in {"promote", "record-release", "install", "uninstall", "hook-install", "hook-uninstall"} and not plan.dry_run and not changed:
             report_status = "no-change"
         else:
             report_status = "success"
@@ -399,6 +511,45 @@ class SkillManager:
             results=results,
             diagnostics=diagnostics,
         )
+
+
+def _installation_with_hooks(
+    candidates: tuple[Candidate, ...], skills: tuple[str, ...], agents: tuple[str, ...], dry_run: bool,
+    home: Path, repository_root: Path, environ: Mapping[str, str],
+) -> tuple[tuple[Result, ...], tuple[Diagnostic, ...], str | None]:
+    """Install one Stable Skill and its declared hook with compensating rollback."""
+
+    if len(skills) != 1 or len(agents) != 1:
+        return (), (Diagnostic("error", "WITH_HOOKS_EXACTLY_ONE", "--with-hooks requires exactly one Skill and one Agent Target"),), None
+    planned, diagnostics, _ = _installation_results(candidates, skills, agents, False, True, home, repository_root, environ, False)
+    if any(item.severity == "error" for item in diagnostics):
+        return planned, diagnostics, None
+    skill, agent = skills[0], agents[0]
+    stable = next((candidate for candidate in candidates if candidate.source is CandidateSource.STABLE and canonical_skill_name(candidate) == skill), None)
+    if stable is None:
+        return planned, (Diagnostic("error", "STABLE_SKILL_NOT_FOUND", f"stable Skill not found: {skill}"),), None
+    target = _resolved_targets(home, environ)[agent]
+    integrations, manifest_diagnostics = discover_hook_integrations(stable.path)
+    if manifest_diagnostics:
+        return planned, manifest_diagnostics, None
+    if not integrations:
+        return planned, (Diagnostic("error", "HOOK_INTEGRATION_UNDECLARED", f"{skill} declares no hook integration"),), None
+    if dry_run:
+        hook_result, hook_diagnostics = manage_commit_gate("install", skill, target, stable.path, True)
+        return (*planned, hook_result), hook_diagnostics, None
+    with exclusive_repository_lock(repository_root):
+        with exclusive_target_locks((target.config_root,)):
+            fresh_scan = scan_repository(repository_root)
+            installed, installation_diagnostics, transaction_id = _installation_results(fresh_scan.candidates, skills, agents, False, False, home, repository_root, environ, False)
+            if any(item.severity == "error" for item in installation_diagnostics):
+                return installed, installation_diagnostics, transaction_id
+            fresh_stable = next(candidate for candidate in fresh_scan.candidates if candidate.source is CandidateSource.STABLE and canonical_skill_name(candidate) == skill)
+            hook_result, hook_diagnostics = manage_commit_gate("install", skill, target, fresh_stable.path, False)
+            if any(item.severity == "error" for item in hook_diagnostics):
+                if installed[0].outcome == "installed":
+                    _installation_results(fresh_scan.candidates, skills, agents, True, False, home, repository_root, environ, False)
+                return (*installed, hook_result), hook_diagnostics, transaction_id
+            return (*installed, hook_result), (), transaction_id
 
 
 def _installation_results(
@@ -513,6 +664,7 @@ def _installation_results(
                         "config_root": str(targets[agent].config_root),
                         "skill_root": str(targets[agent].skills_root),
                         "package_identity": _package_identity_or_unavailable(stable_path),
+                        "hook_integrations": [item.get("id") for item in discover_hook_integrations(stable_path)[0]],
                     },
                     target=agent,
                 )
@@ -950,6 +1102,392 @@ def _promotion_messages(
     return messages, metadata, tuple(diagnostics)
 
 
+def _read_promotion_receipts(
+    root: Path,
+) -> tuple[dict[str, dict[str, str]], Diagnostic | None]:
+    """Read the typed Promotion Receipt map used by Release Backfill."""
+
+    state_path = root / ".skill-manager" / "state.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, Diagnostic(
+            "error", "PROMOTION_RECEIPT_MISSING", "manager state has no Promotion Receipts"
+        )
+    except (OSError, ValueError) as exc:
+        return {}, Diagnostic("error", "INVALID_MANAGER_STATE", str(exc))
+    if (
+        not isinstance(state, dict)
+        or state.get("schema_version") != 1
+        or not isinstance(state.get("receipts"), dict)
+    ):
+        return {}, Diagnostic(
+            "error", "UNSUPPORTED_MANAGER_STATE", "invalid or unsupported manager state schema"
+        )
+    receipts: dict[str, dict[str, str]] = {}
+    for skill, raw_receipt in state["receipts"].items():
+        if not isinstance(skill, str) or not isinstance(raw_receipt, dict):
+            return {}, Diagnostic(
+                "error", "INVALID_MANAGER_STATE", "Promotion Receipt entry is invalid"
+            )
+        identity = raw_receipt.get("identity")
+        transaction_id = raw_receipt.get("transaction_id")
+        recorded_at = raw_receipt.get("recorded_at")
+        if not all(
+            isinstance(value, str)
+            for value in (identity, transaction_id, recorded_at)
+        ):
+            return {}, Diagnostic(
+                "error", "INVALID_MANAGER_STATE", f"Promotion Receipt is invalid: {skill}"
+            )
+        receipts[skill] = {
+            "identity": identity,
+            "transaction_id": transaction_id,
+            "recorded_at": recorded_at,
+        }
+    return receipts, None
+
+
+def _record_release_result(
+    candidates: tuple[Candidate, ...],
+    skill_names: tuple[str, ...],
+    select_all: bool,
+    root: Path,
+    dry_run: bool,
+    commit_message_files: tuple[str, ...],
+) -> tuple[tuple[Result, ...], tuple[Diagnostic, ...]]:
+    """Plan or apply explicit Git backfill for existing Promotion Receipts."""
+
+    stable_candidates = {
+        name: candidate
+        for candidate in candidates
+        if candidate.source is CandidateSource.STABLE
+        and (name := canonical_skill_name(candidate)) is not None
+    }
+    selected_names = (
+        tuple(sorted(stable_candidates))
+        if select_all
+        else tuple(sorted(dict.fromkeys(skill_names)))
+    )
+    missing = [name for name in selected_names if name not in stable_candidates]
+    if missing:
+        return (), tuple(
+            Diagnostic(
+                "error",
+                "RELEASE_STABLE_MISSING",
+                f"Stable Skill not found: {name}",
+            )
+            for name in missing
+        )
+    selected = [stable_candidates[name] for name in selected_names]
+    diagnostics = [
+        diagnostic
+        for candidate in selected
+        for diagnostic in validate_candidate(candidate, root)
+    ]
+    messages, message_metadata, message_diagnostics = _promotion_messages(
+        commit_message_files, selected
+    )
+    diagnostics.extend(message_diagnostics)
+    if set(messages) != set(selected_names):
+        diagnostics.append(
+            Diagnostic(
+                "error",
+                "COMMIT_MESSAGE_SET_MISMATCH",
+                "provide exactly one message file per selected Skill",
+            )
+        )
+    receipts, receipt_diagnostic = _read_promotion_receipts(root)
+    if receipt_diagnostic is not None:
+        diagnostics.append(receipt_diagnostic)
+    failure = git_release_preflight(root)
+    if failure is not None:
+        diagnostics.append(Diagnostic("error", failure, "Git release preflight failed"))
+    if diagnostics:
+        return (), tuple(diagnostics)
+
+    changes: list[Candidate] = []
+    no_change: list[Result] = []
+    selected_receipts: dict[str, dict[str, str]] = {}
+    try:
+        for candidate in selected:
+            skill = str(canonical_skill_name(candidate))
+            receipt = receipts.get(skill)
+            if receipt is None:
+                diagnostics.append(
+                    Diagnostic(
+                        "error",
+                        "PROMOTION_RECEIPT_MISSING",
+                        f"Promotion Receipt not found: {skill}",
+                    )
+                )
+                continue
+            identity = package_identity(candidate.path)
+            if receipt["identity"] != identity:
+                diagnostics.append(
+                    Diagnostic(
+                        "error",
+                        "PROMOTION_RECEIPT_MISMATCH",
+                        f"Stable identity does not match Promotion Receipt: {skill}",
+                    )
+                )
+                continue
+            selected_receipts[skill] = receipt
+            recorded = release_for_receipt(
+                root, skill, identity, receipt["transaction_id"]
+            )
+            if recorded is not None:
+                tag, commit = recorded
+                no_change.append(
+                    Result(
+                        "stable",
+                        skill,
+                        str(candidate.path),
+                        "no-change",
+                        {
+                            "package_identity": identity,
+                            "recording_mode": "backfill",
+                            "release_commit": commit,
+                            "release_tag": tag,
+                            "promotion_transaction_id": receipt["transaction_id"],
+                        },
+                    )
+                )
+                continue
+            if not release_path_has_changes(root, candidate.path):
+                diagnostics.append(
+                    Diagnostic(
+                        "error",
+                        "RELEASE_BACKFILL_NO_GIT_CHANGES",
+                        f"Stable Skill has no scoped Git change to record: {skill}",
+                    )
+                )
+                continue
+            changes.append(candidate)
+    except (IdentityError, OSError, subprocess.CalledProcessError) as exc:
+        diagnostics.append(Diagnostic("error", "RELEASE_BACKFILL_PREFLIGHT_FAILED", str(exc)))
+    if diagnostics:
+        return tuple(no_change), tuple(diagnostics)
+
+    state_diagnostic = _manager_state_diagnostic(root)
+    if state_diagnostic is not None:
+        return tuple(no_change), (state_diagnostic,)
+    filesystem_error = mutation_filesystem_error((root,))
+    if filesystem_error is not None:
+        return tuple(no_change), (
+            Diagnostic(
+                "error",
+                filesystem_error,
+                "filesystem does not support durable Atomic Batch mutation",
+            ),
+        )
+    if dry_run:
+        existing_tags = set(git_output(root, "tag", "--list").splitlines())
+        release_instant = datetime.now(timezone.utc).astimezone(
+            ZoneInfo("Asia/Shanghai")
+        )
+        previews: list[Result] = []
+        for candidate in changes:
+            skill = str(canonical_skill_name(candidate))
+            tag = release_tag_name(skill, release_instant, existing_tags)
+            existing_tags.add(tag)
+            previews.append(
+                Result(
+                    "stable",
+                    skill,
+                    str(candidate.path),
+                    "would-record-release",
+                    {
+                        "package_identity": package_identity(candidate.path),
+                        "recording_mode": "backfill",
+                        "release_state": "provisional",
+                        "release_tag": tag,
+                        "promotion_transaction_id": selected_receipts[skill][
+                            "transaction_id"
+                        ],
+                        "test_state": "not-run",
+                    },
+                )
+            )
+        return tuple(sorted((*no_change, *previews), key=lambda item: item.skill)), ()
+    if not changes:
+        return tuple(no_change), ()
+    recorded, record_diagnostics = _record_release_batch(
+        changes,
+        root,
+        selected_receipts,
+        messages,
+        message_metadata,
+    )
+    return tuple(sorted((*no_change, *recorded), key=lambda item: item.skill)), record_diagnostics
+
+
+def _record_release_batch(
+    candidates: list[Candidate],
+    root: Path,
+    receipts: dict[str, dict[str, str]],
+    messages: dict[str, str],
+    message_metadata: dict[str, dict[str, str]],
+) -> tuple[tuple[Result, ...], tuple[Diagnostic, ...]]:
+    """Backfill scoped commits and tags as one recoverable Git-only batch."""
+
+    for candidate in candidates:
+        test = run_skill_test(candidate, root)
+        if test.diagnostics:
+            return (
+                Result("stable", candidate.name, str(candidate.path), "invalid", test.details),
+            ), test.diagnostics
+    transaction_id = str(uuid.uuid4())
+    release_instant = datetime.now(timezone.utc)
+    original_head = git_output(root, "rev-parse", "HEAD")
+    original_branch = git_output(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    existing_tags = set(git_output(root, "tag", "--list").splitlines())
+    release_tags: dict[str, str] = {}
+    for candidate in candidates:
+        skill = str(canonical_skill_name(candidate))
+        tag = release_tag_name(
+            skill,
+            release_instant.astimezone(ZoneInfo("Asia/Shanghai")),
+            existing_tags,
+        )
+        release_tags[skill] = tag
+        existing_tags.add(tag)
+    manager_root = root / ".skill-manager"
+    manager_root.mkdir(mode=0o700, exist_ok=True)
+    transaction = _create_transaction_directory(root, transaction_id)
+    entries = [
+        {
+            "skill": str(canonical_skill_name(candidate)),
+            "package_identity": package_identity(candidate.path),
+            "promotion_transaction_id": receipts[
+                str(canonical_skill_name(candidate))
+            ]["transaction_id"],
+            "promoted_at": receipts[str(canonical_skill_name(candidate))]["recorded_at"],
+        }
+        for candidate in candidates
+    ]
+    plan_hash = write_plan(
+        transaction / "plan.json",
+        {
+            "journal_schema_version": 1,
+            "transaction_id": transaction_id,
+            "operation_type": "record-release",
+            "skills": entries,
+            "release_instant": release_instant.isoformat().replace("+00:00", "Z"),
+            "original_head": original_head,
+            "original_branch": original_branch,
+            "release_tags": release_tags,
+            "commit_messages": message_metadata,
+        },
+    )
+    events = transaction / "events.jsonl"
+    append_event(events, plan_hash, "PREPARED")
+    release_commits: dict[str, str] = {}
+    try:
+        append_event(events, plan_hash, "APPLYING")
+        for candidate in candidates:
+            skill = str(canonical_skill_name(candidate))
+            identity = package_identity(candidate.path)
+            receipt = receipts[skill]
+            annotation = (
+                f"Release {skill}\n\n"
+                f"Skill: {skill}\n"
+                f"Package-Identity: {identity}\n"
+                f"Atomic-Batch: {transaction_id}\n"
+                f"Recorded-At: {release_instant.isoformat(timespec='seconds').replace('+00:00', 'Z')}\n"
+                "Recording-Mode: backfill\n"
+                f"Promotion-Transaction: {receipt['transaction_id']}\n"
+                f"Promoted-At: {receipt['recorded_at']}"
+            )
+            expected_parent = git_output(root, "rev-parse", "HEAD")
+            append_event(
+                events,
+                plan_hash,
+                "PENDING",
+                {
+                    "kind": "release",
+                    "skill": skill,
+                    "expected_parent": expected_parent,
+                    "tag": release_tags[skill],
+                },
+            )
+            release_commits[skill] = record_skill_release(
+                root,
+                candidate.path,
+                messages[skill],
+                release_tags[skill],
+                annotation,
+            )
+            append_event(
+                events,
+                plan_hash,
+                "APPLIED",
+                {
+                    "kind": "release",
+                    "skill": skill,
+                    "commit": release_commits[skill],
+                    "tag": release_tags[skill],
+                },
+            )
+        append_event(events, plan_hash, "COMMITTED")
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        try:
+            append_event(events, plan_hash, "ROLLING_BACK")
+            known_release_commits = list(release_commits.values())
+            current_head = git_output(root, "rev-parse", f"refs/heads/{original_branch}")
+            if current_head not in {original_head, *known_release_commits}:
+                parent = git_output(root, "rev-parse", f"{current_head}^")
+                if parent in {original_head, *known_release_commits}:
+                    known_release_commits.append(current_head)
+            rollback_git_release(
+                root,
+                original_branch,
+                original_head,
+                tuple(release_tags.values()),
+                transaction_id,
+                tuple(known_release_commits),
+            )
+            append_event(events, plan_hash, "ROLLED_BACK")
+            _clean_rolled_back_transaction(transaction, plan_hash)
+        except (OSError, JournalError, subprocess.CalledProcessError) as rollback_exc:
+            return (), (
+                Diagnostic(
+                    "error",
+                    "RECOVERY_REQUIRED",
+                    f"Git rollback refused: {rollback_exc}",
+                ),
+            )
+        return (), (Diagnostic("error", "RELEASE_BACKFILL_FAILED", str(exc)),)
+    cleanup_diagnostics: tuple[Diagnostic, ...] = ()
+    try:
+        append_event(events, plan_hash, "CLEANING")
+        append_event(events, plan_hash, "CLEANED")
+        shutil.rmtree(transaction)
+        _fsync_directory(transaction.parent)
+    except OSError as exc:
+        cleanup_diagnostics = (
+            Diagnostic("warning", "TRANSACTION_CLEANUP_PENDING", str(exc)),
+        )
+    return tuple(
+        Result(
+            "stable",
+            skill,
+            str(root / "skills" / skill),
+            "release-recorded",
+            {
+                "transaction_id": transaction_id,
+                "package_identity": receipts[skill]["identity"],
+                "recording_mode": "backfill",
+                "promotion_transaction_id": receipts[skill]["transaction_id"],
+                "release_commit": release_commits[skill],
+                "release_tag": release_tags[skill],
+                "test_state": "passed",
+            },
+        )
+        for skill in sorted(release_commits)
+    ), cleanup_diagnostics
+
+
 def _promote_batch(
     candidates: list[Candidate],
     root: Path,
@@ -1272,6 +1810,96 @@ def _recover_result(root: Path, dry_run: bool) -> tuple[tuple[Result, ...], tupl
             return (), rollback_diagnostics
         _clean_rolled_back_transaction(transaction, plan_hash)
         return (Result("recovery", transaction.name, str(transaction), "rolled-back"),), ()
+    if plan.get("operation_type") == "record-release" and isinstance(
+        plan.get("skills"), list
+    ):
+        entries = plan["skills"]
+        if not all(
+            isinstance(entry, dict) and isinstance(entry.get("skill"), str)
+            for entry in entries
+        ):
+            return (), (
+                Diagnostic(
+                    "error",
+                    "RECOVERY_REQUIRED",
+                    "Release Backfill journal lacks valid skills",
+                ),
+            )
+        original_head = plan.get("original_head")
+        original_branch = plan.get("original_branch")
+        release_tags = plan.get("release_tags")
+        if (
+            not isinstance(original_head, str)
+            or not isinstance(original_branch, str)
+            or not isinstance(release_tags, dict)
+        ):
+            return (), (
+                Diagnostic(
+                    "error",
+                    "RECOVERY_REQUIRED",
+                    "Release Backfill journal lacks Git rollback state",
+                ),
+            )
+        append_event(transaction / "events.jsonl", plan_hash, "ROLLING_BACK")
+        release_commit_list = [
+            str(details["commit"])
+            for event in events
+            if event.get("type") == "APPLIED"
+            and isinstance((details := event.get("details")), dict)
+            and details.get("kind") == "release"
+            and isinstance(details.get("commit"), str)
+        ]
+        applied_release_skills = {
+            str(details["skill"])
+            for event in events
+            if event.get("type") == "APPLIED"
+            and isinstance((details := event.get("details")), dict)
+            and details.get("kind") == "release"
+            and isinstance(details.get("skill"), str)
+        }
+        current_head = git_output(root, "rev-parse", f"refs/heads/{original_branch}")
+        for event in events:
+            details = event.get("details")
+            if (
+                event.get("type") != "PENDING"
+                or not isinstance(details, dict)
+                or details.get("kind") != "release"
+            ):
+                continue
+            skill = details.get("skill")
+            expected_parent = details.get("expected_parent")
+            if (
+                not isinstance(skill, str)
+                or not isinstance(expected_parent, str)
+                or skill in applied_release_skills
+            ):
+                continue
+            if current_head != expected_parent:
+                if not is_scoped_release_commit(
+                    root, current_head, expected_parent, skill
+                ):
+                    return (), (
+                        Diagnostic(
+                            "error",
+                            "RECOVERY_REQUIRED",
+                            "unrecognized Git state after Release Backfill interruption",
+                        ),
+                    )
+                release_commit_list.append(current_head)
+        try:
+            rollback_git_release(
+                root,
+                original_branch,
+                original_head,
+                tuple(str(tag) for tag in release_tags.values()),
+                transaction.name,
+                tuple(release_commit_list),
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            return (), (Diagnostic("error", "RECOVERY_REQUIRED", str(exc)),)
+        append_event(transaction / "events.jsonl", plan_hash, "ROLLED_BACK")
+        _clean_rolled_back_transaction(transaction, plan_hash)
+        return (Result("recovery", transaction.name, str(transaction), "rolled-back"),), ()
     if plan.get("operation_type") == "promote" and isinstance(plan.get("skills"), list):
         entries = plan["skills"]
         if not all(isinstance(entry, dict) and isinstance(entry.get("skill"), str) for entry in entries):
@@ -1412,6 +2040,35 @@ def _committed_state_diagnostic(root: Path, plan: dict[str, object]) -> Diagnost
             stable = root / "skills" / str(entry["skill"])
             if _tree_identity(stable) != entry.get("after_identity"):
                 return Diagnostic("error", "RECOVERY_REQUIRED", f"committed Promotion state drifted: {stable}")
+    elif operation_type == "record-release":
+        transaction_id = plan.get("transaction_id")
+        release_tags = plan.get("release_tags")
+        if not isinstance(transaction_id, str) or not isinstance(release_tags, dict):
+            return Diagnostic(
+                "error",
+                "RECOVERY_REQUIRED",
+                "committed Release Backfill journal lacks tags",
+            )
+        try:
+            for tag in release_tags.values():
+                if not isinstance(tag, str):
+                    return Diagnostic(
+                        "error", "RECOVERY_REQUIRED", "Release Backfill tag is invalid"
+                    )
+                annotation = git_output(
+                    root,
+                    "for-each-ref",
+                    f"refs/tags/{tag}",
+                    "--format=%(contents)",
+                )
+                if f"Atomic-Batch: {transaction_id}" not in annotation:
+                    return Diagnostic(
+                        "error",
+                        "RECOVERY_REQUIRED",
+                        f"committed Release Backfill tag is missing or changed: {tag}",
+                    )
+        except subprocess.CalledProcessError as exc:
+            return Diagnostic("error", "RECOVERY_REQUIRED", str(exc))
     return None
 
 

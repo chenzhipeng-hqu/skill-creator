@@ -58,6 +58,7 @@ class Plan:
     replace_stable_drift: bool = False
     record_release: bool = False
     commit_message_files: tuple[str, ...] = ()
+    with_hooks: bool = False
 
 
 @dataclass(frozen=True)

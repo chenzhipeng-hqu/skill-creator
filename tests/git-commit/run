@@ -1,0 +1,29 @@
+#!/bin/bash
+set -eu
+
+repo_root=${SKILL_REPO_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)}
+skill_root=${SKILL_UNDER_TEST:-$repo_root/sk-git-commit}
+gate=$skill_root/scripts/commit-gate.sh
+state_dir=$(mktemp -d)
+trap 'rm -rf "$state_dir"' EXIT HUP INT TERM
+
+run_gate() {
+  COMMIT_GATE_STATE_DIR=$state_dir "$gate"
+}
+
+allow_output=$(printf '%s' '{"session_id":"claude-session","tool_name":"Bash","tool_input":{"command":"git status --short"}}' | run_gate)
+test "$allow_output" = '{"decision":"allow"}'
+
+block_output=$(printf '%s' '{"session_id":"claude-session","tool_name":"Bash","tool_input":{"command":"git commit -m test"}}' | run_gate)
+printf '%s' "$block_output" | jq -e '.decision == "block"' >/dev/null
+
+retry_output=$(printf '%s' '{"session_id":"claude-session","tool_name":"Bash","tool_input":{"command":"git commit -m test"}}' | run_gate)
+test "$retry_output" = '{"decision":"allow"}'
+
+codex_block=$(printf '%s' '{"session_id":"codex-session","tool_name":"shell_command","tool_input":{"shell_command":"git -C /tmp/example commit -m test"}}' | run_gate)
+printf '%s' "$codex_block" | jq -e '.decision == "block"' >/dev/null
+
+codex_retry=$(printf '%s' '{"session_id":"codex-session","tool_name":"shell_command","tool_input":{"shell_command":"git -C /tmp/example commit -m test"}}' | run_gate)
+test "$codex_retry" = '{"decision":"allow"}'
+
+test -z "$(find "$state_dir" -type f -print -quit)"
