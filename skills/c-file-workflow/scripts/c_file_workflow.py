@@ -276,15 +276,25 @@ def _atomic_batch_replace(items: list[tuple[Path, bytes, int]]) -> None:
             os.replace(temporary, path)
             replaced.append((path, old_data, old_mode))
     except Exception as exc:
+        rollback_failures: list[str] = []
         for path, old_data, old_mode in reversed(replaced):
+            restore: Path | None = None
             try:
                 if old_data is None:
                     path.unlink(missing_ok=True)
                 else:
                     restore = _temporary_file(path, old_data, old_mode or 0o644)
                     os.replace(restore, path)
-            except OSError:
-                pass
+            except OSError as rollback_exc:
+                rollback_failures.append(f"{path}: {rollback_exc}")
+            finally:
+                if restore is not None:
+                    restore.unlink(missing_ok=True)
+        if rollback_failures:
+            raise WorkflowError(
+                "atomic file replacement failed and rollback failed: "
+                + "; ".join(rollback_failures)
+            ) from exc
         raise WorkflowError(f"atomic file replacement failed: {exc}") from exc
     finally:
         for _, temporary, _, _ in prepared:
@@ -395,6 +405,10 @@ def _expand_inputs(args: argparse.Namespace) -> list[Path]:
         path = Path(value).expanduser()
         if not path.exists() and not path.is_symlink():
             raise WorkflowError(f"input does not exist: {path}")
+        if path.is_symlink() and path.is_dir() and args.recursive:
+            raise WorkflowError(
+                f"symbolic-link directory is not supported for recursive input: {path}"
+            )
         if path.is_dir():
             if not args.recursive:
                 raise WorkflowError(f"directory input requires --recursive: {path}")

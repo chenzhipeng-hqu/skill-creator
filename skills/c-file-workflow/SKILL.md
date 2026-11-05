@@ -1,6 +1,6 @@
 ---
 name: c-file-workflow
-description: Create, format, and check self-authored C source and header files. Use for plain C/H scaffolding, Pub/CB/Ops component files, mechanical clang-format layout, component-structure checks, register-structure checks, or behavior-aware migration into the component pattern; do not apply it automatically to vendor, generated, or ordinary logic-only edits.
+description: Create, format, and check self-authored C source and header files. Use for plain C/H scaffolding, Pub/CB/Ops component files, mechanical clang-format layout, component-structure checks, register-structure checks, behavior-aware migration into the component pattern, or creating or editing embedded Shell help/usage text in self-authored C files; do not apply it automatically to vendor, generated, general Shell tasks, or ordinary C logic-only edits.
 ---
 
 # C File Workflow
@@ -18,6 +18,8 @@ Use the bundled script for deterministic creation, formatting, and read-only che
 - Check register structures: `python3 scripts/c_file_workflow.py --check --register chip.c chip.h`
 
 Run `python3 scripts/c_file_workflow.py --help` for output paths, recursion, exclusions, symlinks, author, style, and clang-format selection.
+
+For requests to create or edit embedded Shell help/usage text in self-authored C files, read [Shell usage guidance](references/shell-usage.md). This is Agent writing guidance, not a script operation or an automatic formatting/checking rule.
 
 ## Boundaries
 
