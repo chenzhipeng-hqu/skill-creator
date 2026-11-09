@@ -1,0 +1,3 @@
+interface:
+  display_name: "课程学习与答题"
+  short_description: "学习课程、自动处理继续学习提示与防挂机验证，按回退能力查证答题并留档"
