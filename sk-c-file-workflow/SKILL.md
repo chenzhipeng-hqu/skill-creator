@@ -1,6 +1,6 @@
 ---
 name: c-file-workflow
-description: Create, format, and check self-authored C source and header files. Use for plain C/H scaffolding, Pub/CB/Ops component files, mechanical clang-format layout, component-structure checks, register-structure checks, or behavior-aware migration into the component pattern; do not apply it automatically to vendor, generated, or ordinary logic-only edits.
+description: Create, format, and check self-authored C source and header files. Use for plain C/H scaffolding, Pub/CB/Ops component files, mechanical clang-format layout, component-structure checks, register-structure checks, behavior-aware migration into the component pattern, or creating or editing embedded Shell help/usage text in self-authored C files; do not apply it automatically to vendor, generated, general Shell tasks, or ordinary C logic-only edits.
 ---
 
 # C File Workflow
@@ -19,11 +19,13 @@ Use the bundled script for deterministic creation, formatting, and read-only che
 
 Run `python3 scripts/c_file_workflow.py --help` for output paths, recursion, exclusions, symlinks, author, style, and clang-format selection.
 
+For requests to create or edit embedded Shell help/usage text in self-authored C files, read [Shell usage guidance](references/shell-usage.md). This is Agent writing guidance, not a script operation or an automatic formatting/checking rule.
+
 ## Boundaries
 
 - Treat formatting as mechanical layout only. Never claim that it proves syntax, compilation, target behavior, or hardware behavior.
 - Do not insert Component Structure into an existing file mechanically. For a requested migration, first understand and preserve its behavior, make the architectural changes as normal code edits, and then run format and checks.
-- Read [component patterns](references/component-patterns.md) when adding cross-module public handles, callbacks, GPIO/platform operations, or other component extensions.
+- Read [component patterns](references/component-patterns.md) when creating a command-driven Pub/CB/Ops module, implementing a caller of its `cmd()`/`result()` interface, or adding cross-module public handles, callbacks, GPIO/platform operations, or other component extensions.
 - Read [register structures](references/register-structures.md) when implementing or reviewing a documented external-chip register map. Do not invent register facts that are absent from the device documentation.
 - Keep vendor, third-party, generated, and externally maintained files out of bulk processing. Process one only when the user explicitly brings that exact file under local ownership.
 

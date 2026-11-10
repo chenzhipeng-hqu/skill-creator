@@ -69,6 +69,8 @@ class WorkflowTests(unittest.TestCase):
                 "-Wall",
                 "-Wextra",
                 "-Werror",
+                "-include",
+                str(FIXTURES / "creation" / "ticks.h"),
                 "-I",
                 str(self.root),
                 "-c",
@@ -87,6 +89,23 @@ class WorkflowTests(unittest.TestCase):
         both = invoke("--check", "--component", str(source), str(header))
         self.assert_success(both)
         self.assertNotIn("duplicate input", both.stderr)
+
+    def test_component_command_ownership(self) -> None:
+        self.assert_success(invoke("uart", "--output", str(self.root)))
+        executable = self.root / "component_owner"
+        compiled = subprocess.run(
+            [
+                "gcc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                "-I", str(self.root), "-I", str(FIXTURES / "creation"),
+                str(FIXTURES / "creation" / "component_owner.c"), "-o", str(executable),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        executed = subprocess.run([str(executable)], capture_output=True, text=True, check=False)
+        self.assertEqual(executed.returncode, 0, executed.stdout + executed.stderr)
 
     def test_all_generated_templates_compile_as_strict_c11(self) -> None:
         self.assert_success(invoke("--plain", "board_cfg", "--output", str(self.root)))
@@ -109,9 +128,11 @@ class WorkflowTests(unittest.TestCase):
     def test_component_handler_order_is_checked(self) -> None:
         self.assert_success(invoke("uart", "--output", str(self.root)))
         source = self.root / "uart.c"
-        text = source.read_text()
-        text = text.replace("    st_init,\n    st_end,", "    st_end,\n    st_init,")
-        source.write_text(text)
+        lines = source.read_text().splitlines(keepends=True)
+        init = lines.index("    st_init,\n")
+        end = lines.index("    st_end,\n")
+        lines[init], lines[end] = lines[end], lines[init]
+        source.write_text("".join(lines))
         result = invoke("--check", "--component", str(source))
         self.assertEqual(result.returncode, 1)
         self.assertIn("handler names or order", result.stderr)
