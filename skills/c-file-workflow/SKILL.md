@@ -25,7 +25,7 @@ For requests to create or edit embedded Shell help/usage text in self-authored C
 
 - Treat formatting as mechanical layout only. Never claim that it proves syntax, compilation, target behavior, or hardware behavior.
 - Do not insert Component Structure into an existing file mechanically. For a requested migration, first understand and preserve its behavior, make the architectural changes as normal code edits, and then run format and checks.
-- Read [component patterns](references/component-patterns.md) when adding cross-module public handles, callbacks, GPIO/platform operations, or other component extensions.
+- Read [component patterns](references/component-patterns.md) when creating a command-driven Pub/CB/Ops module, implementing a caller of its `cmd()`/`result()` interface, or adding cross-module public handles, callbacks, GPIO/platform operations, or other component extensions.
 - Read [register structures](references/register-structures.md) when implementing or reviewing a documented external-chip register map. Do not invent register facts that are absent from the device documentation.
 - Keep vendor, third-party, generated, and externally maintained files out of bulk processing. Process one only when the user explicitly brings that exact file under local ownership.
 
